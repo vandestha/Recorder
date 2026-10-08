@@ -1,0 +1,5935 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local TweenService = game:GetService("TweenService")
+local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
+local CoreGui = game:GetService("CoreGui")
+local Lighting = game:GetService("Lighting")
+
+local LocalPlayer = Players.LocalPlayer
+
+local ScriptClosed = false
+
+local CONFIG = {
+    Folder = "boneto_autowalk"
+}
+
+-- [ TEMA PREMIUM ]
+local THEME = {
+    BaseDark = Color3.fromRGB(10, 11, 16),
+    PanelDark = Color3.fromRGB(18, 20, 28),
+    Outline = Color3.fromRGB(255, 0, 0),
+    OutlineHover = Color3.fromRGB(255, 0, 0),
+    TextWhite = Color3.fromRGB(250, 250, 255),
+    TextGray = Color3.fromRGB(255, 255, 255),
+    Accent = Color3.fromRGB(255, 0, 0),
+    BrightRed = Color3.fromRGB(255, 0, 0),
+    AccentDark = Color3.fromRGB(150, 0, 0),
+    Action = {
+        Record = Color3.fromRGB(239, 68, 68),
+        Play = Color3.fromRGB(16, 185, 129),
+        Pause = Color3.fromRGB(245, 158, 11),
+        Resume = Color3.fromRGB(14, 165, 233),
+        Stop = Color3.fromRGB(239, 68, 68),
+        Delete = Color3.fromRGB(239, 68, 68)
+    }
+}
+
+-- [ MESIN FSM DAN MAKRO ]
+local FSM = {
+    HasAccess = (writefile and readfile and isfile and listfiles and delfile and makefolder and isfolder) ~= nil
+}
+
+function FSM:Init()
+    if self.HasAccess and not isfolder(CONFIG.Folder) then
+        pcall(makefolder, CONFIG.Folder)
+    end
+end
+
+function FSM:Save(fileName, data)
+    if not self.HasAccess then
+        return false
+    end
+
+    fileName = fileName:gsub("[^%w%_]", "")
+
+    if fileName == "" then
+        fileName = "Macro_" .. os.date("%H%M%S")
+    end
+
+    local path = CONFIG.Folder .. "/" .. fileName .. ".json"
+
+    local success, encoded = pcall(function()
+        return HttpService:JSONEncode(data)
+    end)
+
+    if success then
+        pcall(writefile, path, encoded)
+        return true, fileName
+    end
+
+    return false, nil
+end
+
+function FSM:Load(fileName)
+    if not self.HasAccess then
+        return nil
+    end
+
+    local path = CONFIG.Folder .. "/" .. fileName .. ".json"
+
+    if isfile(path) then
+        local success, decoded = pcall(function()
+            return HttpService:JSONDecode(readfile(path))
+        end)
+
+        if success and type(decoded) == "table" then
+            return decoded
+        end
+    end
+
+    return nil
+end
+
+local MacroEngine = {
+    State = "Idle",
+    Speed = 1.0,
+    Frames = {},
+    AnimDict = {},
+    AnimCache = {},
+    DictCounter = 1,
+    StartTime = 0,
+    CurrentTime = 0,
+    PlaybackIndex = 1,
+    LastPlaybackPosition = nil,
+    LastPlaybackFrameIndex = nil,
+    Bin = {},
+    IsM1Down = false,
+    LastM1State = false,
+    ShowPath = false,
+    PathFolder = nil,
+    LoopEnabled = false,
+    LoopDelay = 0,
+    IsLoopWaiting = false,
+    LoopWaitStartTime = 0,
+    _PlaybackAnimator = nil,
+    activeClimbTrack = nil,
+    activeClimbHumanoid = nil,
+    RecordLastPosition = nil,
+}
+
+UserInputService.InputBegan:Connect(function(input, gpe)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        MacroEngine.IsM1Down = true
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input, gpe)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        MacroEngine.IsM1Down = false
+    end
+end)
+
+local function getVisualPathFootCenter(character, root, humanoid)
+    local leftFoot = character:FindFirstChild("LeftFoot")
+        or character:FindFirstChild("Left Leg")
+        or character:FindFirstChild("LeftLowerLeg")
+    local rightFoot = character:FindFirstChild("RightFoot")
+        or character:FindFirstChild("Right Leg")
+        or character:FindFirstChild("RightLowerLeg")
+
+    if leftFoot and rightFoot then
+        return (leftFoot.Position + rightFoot.Position) / 2
+    end
+
+    if root and humanoid then
+        return root.Position - Vector3.new(0, humanoid.HipHeight + (root.Size.Y / 2), 0)
+    end
+
+    return root and root.Position or nil
+end
+
+function MacroEngine:DrawLine(p1, p2)
+    local dist = (p1 - p2).Magnitude
+
+    if dist < 0.05 then
+        return
+    end
+
+    local part = Instance.new("Part")
+    part.Anchored = true
+    part.CanCollide = false
+    part.CastShadow = false
+    part.Material = Enum.Material.Neon
+    part.Color = THEME.BrightRed
+    part.Transparency = 0.5
+    part.Size = Vector3.new(0.12, 0.12, dist)
+    part.CFrame = CFrame.lookAt(p1, p2) * CFrame.new(0, 0, -dist / 2)
+    part.Parent = self.PathFolder
+
+    return part
+end
+
+function MacroEngine:RenderPath(maxFrameIndex)
+    -- Hapus jalur lama terlebih dahulu supaya tidak ada segmen merah
+    -- yang tertinggal setelah UNDO atau saat VISUAL dimatikan.
+    if self.PathFolder then
+        self.PathFolder:Destroy()
+        self.PathFolder = nil
+    end
+
+    local staleFolder = workspace:FindFirstChild("boneto_VisualPath")
+    if staleFolder then
+        staleFolder:Destroy()
+    end
+
+    if not self.ShowPath then
+        return
+    end
+
+    local frameLimit = math.clamp(
+        math.floor(tonumber(maxFrameIndex) or #self.Frames),
+        1,
+        #self.Frames
+    )
+
+    if frameLimit < 2 then
+        return
+    end
+
+    self.PathFolder = Instance.new("Folder")
+    self.PathFolder.Name = "boneto_VisualPath"
+    self.PathFolder.Parent = workspace
+
+    local previousPosition = nil
+
+    -- Offset dari HumanoidRootPart ke titik tengah kedua kaki.
+    -- Ini membuat macro yang sudah dimuat (yang koordinatnya berasal dari
+    -- root/body) tetap dirender tepat di tengah kaki, sama seperti saat RECORD.
+    local footOffset = Vector3.zero
+    do
+        local character = LocalPlayer.Character
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+
+        if character and root and humanoid then
+            local footCenter = getVisualPathFootCenter(character, root, humanoid)
+            if footCenter then
+                footOffset = footCenter - root.Position
+            end
+        end
+    end
+
+    for i = 1, frameLimit do
+        local frame = self.Frames[i]
+        local px = frame and tonumber(frame.pathX)
+        local py = frame and tonumber(frame.pathY)
+        local pz = frame and tonumber(frame.pathZ)
+
+        -- Frame hasil LoadCompetitorJSON memakai posisi RootPart sebagai
+        -- koordinat path. Geser ke offset tengah kedua kaki.
+        if frame and frame.pathFromRoot and px and py and pz then
+            px = px + footOffset.X
+            py = py + footOffset.Y
+            pz = pz + footOffset.Z
+        end
+
+        -- Fallback untuk macro lama yang belum memiliki koordinat VisualPath.
+        -- Gunakan offset kaki yang sama, bukan angka Y tetap, supaya posisi
+        -- tidak kembali berada di badan.
+        if not (px and py and pz) and frame then
+            local rootX = tonumber(frame.px)
+            local rootY = tonumber(frame.py)
+            local rootZ = tonumber(frame.pz)
+
+            if rootX and rootY and rootZ then
+                px = rootX + footOffset.X
+                py = rootY + footOffset.Y
+                pz = rootZ + footOffset.Z
+            end
+        end
+
+        if px and py and pz then
+            local currentPosition = Vector3.new(px, py, pz)
+
+            if previousPosition then
+                self:DrawLine(previousPosition, currentPosition)
+            end
+
+            previousPosition = currentPosition
+        end
+    end
+end
+
+function MacroEngine:CleanUpMovers()
+end
+
+function MacroEngine:CleanUp()
+    for _, item in ipairs(self.Bin) do
+        if typeof(item) == "RBXScriptConnection" then
+            pcall(function()
+                item:Disconnect()
+            end)
+        elseif typeof(item) == "Instance" then
+            pcall(function()
+                item:Destroy()
+            end)
+        end
+    end
+
+    table.clear(self.Bin)
+
+    if self.LastM1State then
+        pcall(function()
+            VirtualInputManager:SendMouseButtonEvent(
+                0,
+                0,
+                0,
+                false,
+                game,
+                1
+            )
+        end)
+
+        self.LastM1State = false
+    end
+
+    self.IsLoopWaiting = false
+    self:ResetCharacterState()
+end
+
+function MacroEngine:ResetCharacterState()
+    local char = LocalPlayer.Character
+
+    if not char then
+        self:CleanUpMovers()
+        return
+    end
+
+    local hum = char:FindFirstChildOfClass("Humanoid")
+
+    if hum then
+        hum.AutoRotate = true
+        hum.PlatformStand = false
+    end
+
+    local animate = char:FindFirstChild("Animate")
+
+    if animate then
+        animate.Disabled = false
+    end
+
+    self:CleanUpMovers()
+end
+
+function MacroEngine:SetupPhysics(root)
+    -- RAW playback tidak menggunakan AO atau mover fisika tambahan.
+end
+
+function MacroEngine:GetAnimId(assetStr)
+    if not self.AnimDict[assetStr] then
+        self.AnimDict[assetStr] = self.DictCounter
+        self.DictCounter = self.DictCounter + 1
+    end
+
+    return self.AnimDict[assetStr]
+end
+
+function MacroEngine:GetAnimAssetById(animIndex)
+    animIndex = tonumber(animIndex)
+    if not animIndex then
+        return nil
+    end
+
+    for assetId, index in pairs(self.AnimDict) do
+        if tonumber(index) == animIndex then
+            return assetId
+        end
+    end
+
+    return nil
+end
+
+-- ========== CLIMB ANIMATION HELPER ==========
+-- STOP tidak menggunakan freeze/Anchored. Track dihentikan normal agar
+-- Animate dapat mengambil alih kembali. Posisi STOP dijaga lewat CFrame.
+local function clearFrozenClimbPose()
+    pcall(function()
+        if activeClimbTrack then
+            activeClimbTrack:Stop(0.12)
+            activeClimbTrack:Destroy()
+        end
+    end)
+    activeClimbTrack = nil
+    activeClimbHumanoid = nil
+end
+
+local function stopClimbAnimation()
+    pcall(function()
+        if activeClimbTrack then
+            activeClimbTrack:Stop(0.15)
+            activeClimbTrack:Destroy()
+        end
+    end)
+
+    activeClimbTrack = nil
+    activeClimbHumanoid = nil
+end
+
+local function stopClimbPresentation(character)
+    stopClimbAnimation()
+
+    if MacroEngine then
+        MacroEngine._LastPlaybackHumanoidState = nil
+    end
+end
+
+local function getClimbAnimationId(character)
+    local animate = character and character:FindFirstChild("Animate")
+    if animate then
+        local climbFolder = animate:FindFirstChild("climb")
+        if climbFolder then
+            local climbAnim = climbFolder:FindFirstChild("ClimbAnim")
+            if climbAnim and climbAnim:IsA("Animation") and climbAnim.AnimationId ~= "" then
+                return climbAnim.AnimationId
+            end
+        end
+    end
+
+    -- Sama seperti kompetitor: fallback ke ClimbAnim Roblox default.
+    return "rbxassetid://180436334"
+end
+
+local function playClimbAnimation(character, humanoid, climbSpeed)
+    if not character or not humanoid then return end
+
+    pcall(function()
+        if activeClimbHumanoid ~= humanoid then
+            stopClimbAnimation()
+
+            local animator = humanoid:FindFirstChildOfClass("Animator")
+            if not animator then
+                animator = Instance.new("Animator")
+                animator.Parent = humanoid
+            end
+
+            local anim = Instance.new("Animation")
+            anim.AnimationId = getClimbAnimationId(character)
+
+            activeClimbTrack = animator:LoadAnimation(anim)
+            activeClimbTrack.Priority = Enum.AnimationPriority.Movement
+            activeClimbTrack.Looped = true
+            activeClimbHumanoid = humanoid
+        end
+
+        if activeClimbTrack and not activeClimbTrack.IsPlaying then
+            activeClimbTrack:Play(0.1, 1, 1)
+        end
+
+        if activeClimbTrack then
+            local animSpeed = math.clamp(math.abs(climbSpeed or 8) / 8, 0.6, 2.5)
+            activeClimbTrack:AdjustSpeed(animSpeed)
+        end
+    end)
+end
+
+
+function MacroEngine:GetClosestFrame(currentPos)
+    if #self.Frames == 0 then
+        return 1, 0
+    end
+
+    local minSqDist = math.huge
+    local closestIdx = 1
+
+    for i, frame in ipairs(self.Frames) do
+        local sqDist =
+            (currentPos - Vector3.new(
+                frame.px,
+                frame.py,
+                frame.pz
+            )).Magnitude
+
+        if sqDist < minSqDist then
+            minSqDist = sqDist
+            closestIdx = i
+        end
+    end
+
+    return closestIdx, self.Frames[closestIdx].t
+end
+
+function MacroEngine:BuildCompetitorJSON()
+    local output = {}
+
+    -- JSON playback hanya menyimpan data inti:
+    -- HipHeight, Velocity, Position, Rotation, MoveDirection, Time,
+    -- Jumping, Walkspeed, Tool, dan State.
+    -- Data animasi climb tambahan tidak diekspor; playback climb tetap
+    -- menggunakan metode target-position yang sudah dipertahankan.
+    for _, frame in ipairs(self.Frames) do
+        local lx = tonumber(frame.lx) or 0
+        local lz = tonumber(frame.lz) or 0
+        local rotation = tonumber(frame.rotation)
+
+        if rotation == nil then
+            if math.abs(lx) > 0.000001 or math.abs(lz) > 0.000001 then
+                rotation = math.atan2(-lx, -lz)
+            else
+                rotation = 0
+            end
+        end
+
+        local stateValue = tonumber(frame.stateValue)
+        if stateValue == nil and frame.humanoidState then
+            local stateItem = Enum.HumanoidStateType[frame.humanoidState]
+            if stateItem then
+                stateValue = stateItem.Value
+            end
+        end
+
+        local outputFrame = {
+            HipHeight = tonumber(frame.hipHeight) or 0,
+            Velocity = {
+                x = tonumber(frame.vx) or 0,
+                y = tonumber(frame.vy) or 0,
+                z = tonumber(frame.vz) or 0
+            },
+            Position = {
+                x = tonumber(frame.px) or 0,
+                y = tonumber(frame.py) or 0,
+                z = tonumber(frame.pz) or 0
+            },
+            Rotation = rotation,
+            MoveDirection = {
+                x = tonumber(frame.mdx) or 0,
+                y = tonumber(frame.mdy) or 0,
+                z = tonumber(frame.mdz) or 0
+            },
+            Time = tonumber(frame.t) or 0,
+            Jumping = frame.jump == true,
+            Walkspeed = tonumber(frame.walkSpeed) or 16,
+            Tool = frame.tool,
+            State = stateValue or Enum.HumanoidStateType.Running.Value
+        }
+
+        if frame.climbPhase ~= nil then
+            outputFrame.ClimbPhase = tonumber(frame.climbPhase)
+        end
+
+        output[#output + 1] = outputFrame
+    end
+
+    return output
+end
+
+function MacroEngine:LoadCompetitorJSON(data)
+    if type(data) ~= "table" then
+        return false
+    end
+
+    local frames = {}
+
+    for i = 1, #data do
+        local item = data[i]
+
+        -- Kompatibel dengan format field inti lama maupun nama field yang
+        -- ditulis dengan huruf kapital.
+        local pos = item and (item.position or item.Position)
+        local vel = item and (item.velocity or item.Velocity)
+        local md = item and (item.moveDirection or item.MoveDirection)
+        local rotationValue = item and (item.rotation or item.Rotation)
+        local timeValue = item and (item.time or item.Time)
+        local jumpValue = item and (item.jumping or item.Jumping)
+        local walkSpeedValue = item and (item.walkSpeed or item.Walkspeed or item.WalkSpeed)
+        local toolValue = item and (item.tool or item.Tool)
+        local stateValue = item and (item.state or item.State)
+        local hipHeightValue = item and (item.hipHeight or item.HipHeight)
+
+        if type(item) == "table"
+            and type(pos) == "table"
+            and type(vel) == "table"
+        then
+            local yaw = tonumber(rotationValue) or 0
+            local stateNumber = tonumber(stateValue)
+
+            frames[#frames + 1] = {
+                hipHeight = tonumber(hipHeightValue) or 2,
+                px = tonumber(pos.x or pos.X) or 0,
+                py = tonumber(pos.y or pos.Y) or 0,
+                pz = tonumber(pos.z or pos.Z) or 0,
+                vx = tonumber(vel.x or vel.X) or 0,
+                vy = tonumber(vel.y or vel.Y) or 0,
+                vz = tonumber(vel.z or vel.Z) or 0,
+                rotation = yaw,
+                mdx = tonumber(md and (md.x or md.X)) or 0,
+                mdy = tonumber(md and (md.y or md.Y)) or 0,
+                mdz = tonumber(md and (md.z or md.Z)) or 0,
+                t = tonumber(timeValue) or 0,
+                jump = jumpValue == true,
+                walkSpeed = tonumber(walkSpeedValue) or 16,
+                tool = toolValue,
+                stateValue = stateNumber,
+                climbTp = tonumber(item.climbTp or item.ClimbTp),
+                climbSpeed = tonumber(item.climbSpeed or item.ClimbSpeed),
+                climbWeight = tonumber(item.climbWeight or item.ClimbWeight),
+                climbPhase = tonumber(item.climbPhase or item.ClimbPhase),
+                -- Data competitor menyimpan posisi karakter/root.
+                -- Tandai agar RenderPath mengubahnya ke titik tengah kedua kaki
+                -- saat VisualPath dirender.
+                pathX = tonumber(pos.x or pos.X) or 0,
+                pathY = tonumber(pos.y or pos.Y) or 0,
+                pathZ = tonumber(pos.z or pos.Z) or 0,
+                pathFromRoot = true,
+                lx = -math.sin(yaw),
+                ly = 0,
+                lz = -math.cos(yaw)
+            }
+        end
+    end
+
+    if #frames == 0 then
+        return false
+    end
+
+    self.Frames = frames
+    self.CurrentTime = 0
+    self.PlaybackIndex = 1
+    self.LastPlaybackPosition = nil
+    self.LastPlaybackFrameIndex = nil
+    return true
+end
+
+
+function MacroEngine:Record()
+    if self.State ~= "Idle" then
+        self:Stop()
+    end
+
+    self:CleanUp()
+
+    table.clear(self.Frames)
+    table.clear(self.AnimDict)
+
+    self.DictCounter = 1
+    self.StartTime = os.clock()
+    self.State = "Recording"
+    self.IsLoopWaiting = false
+    -- Version ini dipakai untuk memberi tahu Heartbeat recorder bahwa UNDO
+    -- baru saja memindahkan titik awal internal ke frame terakhir yang tersisa.
+    self._RecordSyncVersion = (self._RecordSyncVersion or 0) + 1
+
+    if self.PathFolder then
+        self.PathFolder:Destroy()
+        self.PathFolder = nil
+    end
+
+    if self.ShowPath then
+        self.PathFolder = Instance.new("Folder")
+        self.PathFolder.Name = "boneto_VisualPath"
+        self.PathFolder.Parent = workspace
+    end
+
+    local char =
+        LocalPlayer.Character
+        or LocalPlayer.CharacterAdded:Wait()
+
+    local root = char:WaitForChild("HumanoidRootPart")
+    local hum = char:WaitForChild("Humanoid")
+    local initialPathPosition = getVisualPathFootCenter(char, root, hum) or root.Position
+
+    -- Saat RECORD, biarkan Humanoid mengikuti arah input/kamera.
+    -- Jika AutoRotate=false di sini, karakter akan terkunci menghadap satu arah
+    -- sehingga belok kiri/kanan tidak ikut terekam dengan benar.
+    hum.AutoRotate = true
+
+    local initialToolObj = char:FindFirstChildOfClass("Tool")
+    local initialToolName =
+        initialToolObj
+        and initialToolObj.Name
+        or nil
+
+    -- Untuk climb, simpan waktu/speed/weight animasi yang sedang aktif.
+    -- Asset ID tidak direkam; playback tetap mengambil ClimbAnim dari Animate.
+    -- Data ini menjadi timeline kaki yang dipakai kembali saat playback.
+    local recordAnimator = hum:FindFirstChildOfClass("Animator")
+        or hum:WaitForChild("Animator", 2)
+    local climbAnimationIdForRecord = getClimbAnimationId(char)
+
+    local lastPos = root.Position
+    local lastRot = root.CFrame.LookVector
+    -- Posisi terakhir yang benar-benar menjadi ujung VisualPath.
+    -- Nilai ini ikut diperbarui oleh UNDO agar garis berikutnya menyambung
+    -- dari frame terakhir, bukan dari posisi sebelum UNDO.
+    self.RecordLastPosition = initialPathPosition
+    local lastM1 = self.IsM1Down
+    local lastTool = initialToolName
+    local lastHumanoidState = hum:GetState()
+    -- V27.5: phase siklus animasi Climb yang direkam secara kontinu.
+    -- Jangan bergantung pada TimePosition mentah yang pada recording sebelumnya
+    -- bisa hampir tidak bergerak walaupun karakter terus menaiki ladder.
+    local climbPhase = 0
+    local climbPhaseAnimationId = nil
+    local wasRecordingClimbAnimation = false
+
+    local activeRecordTime = 0
+    local lastSampleTime = os.clock()
+    -- V28.6 experiment: pisahkan frekuensi Heartbeat dari frekuensi sample Record.
+    -- Mengikuti metode kompetitor: target sample sekitar 25 Hz (0.04 s).
+    local recordSampleAccumulator = 0
+    local seenRecordSyncVersion = self._RecordSyncVersion or 0
+
+    table.insert(self.Frames, {
+        t = 0,
+        hipHeight = hum.HipHeight,
+        px = root.Position.X,
+        py = root.Position.Y,
+        pz = root.Position.Z,
+        pathX = initialPathPosition.X,
+        pathY = initialPathPosition.Y,
+        pathZ = initialPathPosition.Z,
+        vx = root.AssemblyLinearVelocity.X,
+        vy = root.AssemblyLinearVelocity.Y,
+        vz = root.AssemblyLinearVelocity.Z,
+        avx = root.AssemblyAngularVelocity.X,
+        avy = root.AssemblyAngularVelocity.Y,
+        avz = root.AssemblyAngularVelocity.Z,
+        lx = root.CFrame.LookVector.X,
+        ly = root.CFrame.LookVector.Y,
+        lz = root.CFrame.LookVector.Z,
+        mdx = 0,
+        mdy = 0,
+        mdz = 0,
+        jump = false,
+        rawJump = false,
+        stateChanged = true,
+        recordedDt = 0,
+        walkSpeed = tonumber(hum.WalkSpeed) or 16,
+        rawState = hum:GetState().Name,
+        humanoidState = hum:GetState().Name,
+        stateValue = hum:GetState().Value,
+        tool = initialToolName,
+        m1 = self.IsM1Down,
+        climbPhase = nil
+    })
+
+    table.insert(
+        self.Bin,
+        RunService.Heartbeat:Connect(function()
+            if hum.Health <= 0 then
+                self.State = "Idle"
+                self:CleanUp()
+                return
+            end
+
+            local now = os.clock()
+
+            -- UNDO dapat menghapus frame dan memindahkan karakter ke frame lama.
+            -- Sinkronkan seluruh baseline recorder sebelum menghitung delta berikutnya,
+            -- supaya perpindahan akibat UNDO tidak direkam sebagai gerakan baru yang besar.
+            local currentSyncVersion = self._RecordSyncVersion or 0
+            if currentSyncVersion ~= seenRecordSyncVersion then
+                seenRecordSyncVersion = currentSyncVersion
+
+                local syncFrame = self.Frames[#self.Frames]
+                if syncFrame then
+                    lastPos = Vector3.new(
+                        tonumber(syncFrame.px) or root.Position.X,
+                        tonumber(syncFrame.py) or root.Position.Y,
+                        tonumber(syncFrame.pz) or root.Position.Z
+                    )
+                    lastRot = Vector3.new(
+                        tonumber(syncFrame.lx) or root.CFrame.LookVector.X,
+                        tonumber(syncFrame.ly) or root.CFrame.LookVector.Y,
+                        tonumber(syncFrame.lz) or root.CFrame.LookVector.Z
+                    )
+                    if lastRot.Magnitude < 0.001 then
+                        lastRot = root.CFrame.LookVector
+                    end
+                    lastM1 = syncFrame.m1 == true
+                    lastTool = syncFrame.tool
+                    lastHumanoidState = hum:GetState()
+                    activeRecordTime = tonumber(syncFrame.t) or 0
+
+                    -- Setelah UNDO, pertahankan state frame terakhir agar Roblox
+                    -- tidak sempat masuk ke pose Idle sebelum sample berikutnya.
+                    -- Ini hanya menyelaraskan state animasi; velocity dan timeline
+                    -- Playback tidak disentuh.
+                    local syncStateName = syncFrame.humanoidState
+                    local syncStateEnum = syncStateName and Enum.HumanoidStateType[syncStateName]
+                    if syncStateEnum then
+                        pcall(function()
+                            hum:ChangeState(syncStateEnum)
+                        end)
+                        lastHumanoidState = syncStateEnum
+                    end
+
+                else
+                    lastPos = root.Position
+                    lastRot = root.CFrame.LookVector
+                    lastM1 = self.IsM1Down
+                    lastTool = nil
+                    lastHumanoidState = hum:GetState()
+                    activeRecordTime = 0
+                end
+
+                -- Jangan biarkan delta waktu Heartbeat sebelum/sesudah teleport UNDO
+                -- masuk ke timeline. Sample berikutnya dimulai dari baseline baru.
+                lastSampleTime = now
+                recordSampleAccumulator = 0
+                return
+            end
+
+            -- V28.6: Heartbeat tetap menjadi clock, tetapi Record tidak lagi
+            -- mengambil sample setiap Heartbeat. Target sampling ~25 Hz, seperti
+            -- metode kompetitor (SAMPLE_INTERVAL = 0.04). Ini hanya mengurangi
+            -- noise/sample berlebih; tidak mengubah Physics/Heartbeat Roblox.
+            recordSampleAccumulator += math.max(0, now - lastSampleTime)
+            if recordSampleAccumulator < 0.04 then
+                return
+            end
+            recordSampleAccumulator -= 0.04
+
+            -- Delta waktu di sini adalah waktu nyata sejak sample Record terakhir,
+            -- bukan sejak Heartbeat terakhir. Jadi recordedDt tetap cocok dengan
+            -- Position delta dan Velocity pada sample yang benar-benar direkam.
+            local realDelta = math.max(now - lastSampleTime, 0)
+            lastSampleTime = now
+
+            local currentPos = root.Position
+            local currentPathPosition = getVisualPathFootCenter(char, root, hum) or currentPos
+            local currentRot = root.CFrame.LookVector
+
+            local currentToolObj = char:FindFirstChildOfClass("Tool")
+            local currentToolName = currentToolObj and currentToolObj.Name or nil
+
+            -- Rekam state animasi Climb yang benar-benar sedang dimainkan.
+            local recordedClimbTp = nil
+            local recordedClimbSpeed = nil
+            local recordedClimbWeight = nil
+            local recordedClimbPhase = nil
+            local activeRecordClimbAnimation = nil
+            local isRecordingClimb = false
+
+            if recordAnimator and climbAnimationIdForRecord then
+                for _, track in ipairs(recordAnimator:GetPlayingAnimationTracks()) do
+                    local trackAnimation = track.Animation
+                    if trackAnimation and trackAnimation.AnimationId == climbAnimationIdForRecord then
+                        recordedClimbTp = track.TimePosition
+                        recordedClimbSpeed = track.Speed
+                        recordedClimbWeight = track.WeightCurrent
+                        activeRecordClimbAnimation = track
+                        isRecordingClimb = true
+                        break
+                    end
+                end
+            end
+
+            -- V27.5 RECORD CLIMB PHASE
+            if activeRecordClimbAnimation then
+                local animationLength = tonumber(activeRecordClimbAnimation.Length) or 0
+                local animationSpeed = math.abs(tonumber(activeRecordClimbAnimation.Speed) or 0)
+
+                if animationLength > 0 then
+                    if not wasRecordingClimbAnimation
+                        or climbPhaseAnimationId ~= climbAnimationIdForRecord
+                    then
+                        local initialTimePosition =
+                            tonumber(activeRecordClimbAnimation.TimePosition) or 0
+                        climbPhase =
+                            (initialTimePosition % animationLength)
+                            / animationLength
+                        climbPhaseAnimationId = climbAnimationIdForRecord
+                        wasRecordingClimbAnimation = true
+                    else
+                        climbPhase =
+                            (climbPhase
+                                + (animationSpeed * realDelta / animationLength))
+                            % 1
+                    end
+
+                    recordedClimbPhase = climbPhase
+                end
+            else
+                wasRecordingClimbAnimation = false
+                climbPhaseAnimationId = nil
+                climbPhase = 0
+            end
+
+            local humanoidState = hum:GetState()
+            local stateName = humanoidState.Name
+            local isJumpingState =
+                humanoidState == Enum.HumanoidStateType.Jumping
+
+            -- JUMP RECORD 1X: hanya frame pertama saat masuk Jumping yang
+            -- diberi flag jump. State/velocity tetap direkam setiap frame.
+            local isJump =
+                isJumpingState
+                and humanoidState == Enum.HumanoidStateType.Jumping
+                and lastHumanoidState ~= Enum.HumanoidStateType.Jumping
+
+            local stateChanged = humanoidState ~= lastHumanoidState
+            local m1Changed = self.IsM1Down ~= lastM1
+            local toolChanged = currentToolName ~= lastTool
+
+            -- Timestamp bertambah pada setiap sample. State lama tetap dipertahankan
+            -- untuk sinkronisasi Undo dan tidak dipakai untuk membuang frame.
+            activeRecordTime += realDelta
+
+            -- V28.5: audit sample menggunakan Dt + delta Position + Velocity.
+            -- Ini hanya membersihkan spike posisi horizontal yang jelas tidak
+            -- konsisten dengan gerakan normal. Climb sengaja tidak disentuh.
+            local recordedPosition = currentPos
+            local previousRecordedFrame = self.Frames[#self.Frames]
+            local positionDeltaSpeed = 0
+            local velocityMismatch = false
+            local sampleClamped = false
+
+            if previousRecordedFrame and realDelta > 0 and not isRecordingClimb then
+                local previousPosition = Vector3.new(
+                    tonumber(previousRecordedFrame.px) or currentPos.X,
+                    tonumber(previousRecordedFrame.py) or currentPos.Y,
+                    tonumber(previousRecordedFrame.pz) or currentPos.Z
+                )
+
+                local delta = currentPos - previousPosition
+                local horizontalDelta = Vector3.new(delta.X, 0, delta.Z)
+                positionDeltaSpeed = horizontalDelta.Magnitude / math.max(realDelta, 1 / 240)
+
+                local rawVelocity = root.AssemblyLinearVelocity
+                local horizontalVelocity = Vector3.new(
+                    rawVelocity.X,
+                    0,
+                    rawVelocity.Z
+                )
+                local walkSpeedReference = math.max(
+                    16,
+                    tonumber(hum.WalkSpeed) or 16,
+                    tonumber(previousRecordedFrame.walkSpeed) or 16
+                )
+
+                local velocityReference = math.max(
+                    walkSpeedReference,
+                    horizontalVelocity.Magnitude
+                )
+
+                local allowedHorizontalSpeed = math.max(
+                    80,
+                    velocityReference * 2.5 + 20
+                )
+                local allowedHorizontalDistance =
+                    allowedHorizontalSpeed * realDelta + 0.75
+
+                velocityMismatch =
+                    positionDeltaSpeed > allowedHorizontalSpeed
+                    and horizontalDelta.Magnitude > 3
+
+                if velocityMismatch and horizontalDelta.Magnitude > allowedHorizontalDistance then
+                    local safeHorizontal =
+                        horizontalDelta.Unit * allowedHorizontalDistance
+                    recordedPosition = Vector3.new(
+                        previousPosition.X + safeHorizontal.X,
+                        currentPos.Y,
+                        previousPosition.Z + safeHorizontal.Z
+                    )
+                    sampleClamped = true
+                end
+            end
+
+            table.insert(self.Frames, {
+                t = activeRecordTime,
+                hipHeight = hum.HipHeight,
+                px = recordedPosition.X,
+                py = recordedPosition.Y,
+                pz = recordedPosition.Z,
+                pathX = currentPathPosition.X,
+                pathY = currentPathPosition.Y,
+                pathZ = currentPathPosition.Z,
+                vx = root.AssemblyLinearVelocity.X,
+                vy = root.AssemblyLinearVelocity.Y,
+                vz = root.AssemblyLinearVelocity.Z,
+                avx = root.AssemblyAngularVelocity.X,
+                avy = root.AssemblyAngularVelocity.Y,
+                avz = root.AssemblyAngularVelocity.Z,
+                lx = currentRot.X,
+                ly = currentRot.Y,
+                lz = currentRot.Z,
+                mdx = hum.MoveDirection.X,
+                mdy = hum.MoveDirection.Y,
+                mdz = hum.MoveDirection.Z,
+                jump = isJump,
+                rawJump = isJump,
+                stateChanged = stateChanged,
+                recordedDt = realDelta,
+                positionDeltaSpeed = positionDeltaSpeed,
+                velocityMismatch = velocityMismatch,
+                sampleClamped = sampleClamped,
+                walkSpeed = tonumber(hum.WalkSpeed) or 16,
+                rawState = stateName,
+                humanoidState = stateName,
+                stateValue = (Enum.HumanoidStateType[stateName] and Enum.HumanoidStateType[stateName].Value) or humanoidState.Value,
+                tool = currentToolName,
+                m1 = self.IsM1Down,
+                climbTp = recordedClimbTp,
+                climbSpeed = recordedClimbSpeed,
+                climbWeight = recordedClimbWeight,
+                climbPhase = recordedClimbPhase
+            })
+
+            if self.ShowPath and self.PathFolder then
+                local pathStart = self.RecordLastPosition or currentPathPosition
+                self:DrawLine(pathStart, currentPathPosition)
+            end
+
+            self.RecordLastPosition = currentPathPosition
+            lastPos = currentPos
+            lastRot = currentRot
+            lastM1 = self.IsM1Down
+            lastTool = currentToolName
+            lastHumanoidState = humanoidState
+        end)
+    )
+end
+
+function MacroEngine:UndoRecord(frameCount)
+    if self.State ~= "Recording" then
+        return false, "Undo hanya bisa saat RECORD aktif."
+    end
+
+    frameCount = math.clamp(tonumber(frameCount) or 10, 10, 40)
+    local frameTotal = #self.Frames
+    if frameTotal <= 1 then
+        return false, "Belum ada frame yang bisa dihapus."
+    end
+
+    local removeCount = math.min(frameCount, frameTotal - 1)
+
+    for _ = 1, removeCount do
+        if #self.Frames > 1 then
+            table.remove(self.Frames)
+        end
+    end
+
+    -- Setelah UNDO, waktu dan indeks playback selalu diarahkan ke frame terakhir
+    -- yang masih tersisa agar karakter mengikuti hasil rekaman terbaru.
+    local lastIndex = #self.Frames
+    local lastFrame = self.Frames[lastIndex]
+    self.CurrentTime = (lastFrame and lastFrame.t) or 0
+    self.PlaybackIndex = math.max(1, lastIndex)
+
+    -- Pindahkan karakter ke frame terakhir yang tersisa secara langsung.
+    -- Ini dilakukan setiap kali UNDO, bukan hanya ketika frame lompatan terhapus.
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+
+    if lastFrame and root then
+        local pos = Vector3.new(lastFrame.px, lastFrame.py, lastFrame.pz)
+        local look = Vector3.new(
+            lastFrame.lx or root.CFrame.LookVector.X,
+            lastFrame.ly or root.CFrame.LookVector.Y,
+            lastFrame.lz or root.CFrame.LookVector.Z
+        )
+        if look.Magnitude < 0.001 then
+            look = root.CFrame.LookVector
+        end
+
+        pcall(function()
+            root.CFrame = CFrame.lookAt(pos, pos + look.Unit)
+            -- Sinkronkan ujung VisualPath dengan frame terakhir setelah UNDO.
+            self.RecordLastPosition = Vector3.new(
+                tonumber(lastFrame.pathX) or pos.X,
+                tonumber(lastFrame.pathY) or pos.Y,
+                tonumber(lastFrame.pathZ) or pos.Z
+            )
+            -- Pertahankan velocity/state dari frame terakhir. Jangan paksa Running,
+            -- karena frame terakhir bisa saja Jumping, Freefall, Climbing, dll.
+            if hum then
+                local vx = tonumber(lastFrame.vx) or 0
+                local vy = tonumber(lastFrame.vy) or 0
+                local vz = tonumber(lastFrame.vz) or 0
+                local avx = tonumber(lastFrame.avx) or 0
+                local avy = tonumber(lastFrame.avy) or 0
+                local avz = tonumber(lastFrame.avz) or 0
+                root.AssemblyLinearVelocity = Vector3.new(vx, vy, vz)
+                root.AssemblyAngularVelocity = Vector3.new(avx, avy, avz)
+            end
+        end)
+    end
+
+    -- VisualPath ikut dipotong sesuai frame yang masih tersisa.
+    -- Render dilakukan setelah teleport agar ujung garis tepat di frame terakhir.
+    if self.ShowPath then
+        self:RenderPath(#self.Frames)
+    end
+
+    -- Beri sinyal ke Heartbeat Record() untuk mengadopsi frame terakhir
+    -- sebagai baseline baru sebelum mengambil sample berikutnya.
+    self._RecordSyncVersion = (self._RecordSyncVersion or 0) + 1
+
+    return true, string.format("Undo: %d frame dihapus, karakter dipindahkan ke frame terakhir", removeCount)
+end
+
+function MacroEngine:Play()
+    if #self.Frames == 0 then return end
+    if self.State == "Playing" then return end
+    if self.State == "Paused" then
+        self.State = "Playing"
+        return
+    end
+
+    local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+    local root = char:WaitForChild("HumanoidRootPart")
+    local hum = char:WaitForChild("Humanoid")
+
+    -- Jika STOP sebelumnya menyimpan pose Climb terakhir, lepaskan pose
+    -- tersebut sebelum playback baru dimulai agar tidak terbawa ke route.
+    clearFrozenClimbPose()
+    pcall(function()
+        local oldChar = LocalPlayer.Character
+        local oldAnimate = oldChar and oldChar:FindFirstChild("Animate")
+        if oldAnimate then
+            oldAnimate.Disabled = false
+        end
+    end)
+
+    self:CleanUp()
+    self.State = "Playing"
+
+    -- Start sama seperti baseline: cari frame yang paling dekat dengan posisi karakter.
+    local nearestIndex = 1
+    local nearestDistance = math.huge
+    local startPosition = root.Position
+
+    for i, frame in ipairs(self.Frames) do
+        local px = tonumber(frame.px)
+        local py = tonumber(frame.py)
+        local pz = tonumber(frame.pz)
+        if px and py and pz then
+            local dx = px - startPosition.X
+            local dy = py - startPosition.Y
+            local dz = pz - startPosition.Z
+            local d2 = dx * dx + dy * dy + dz * dz
+            if d2 < nearestDistance then
+                nearestDistance = d2
+                nearestIndex = i
+            end
+        end
+    end
+
+    self.PlaybackIndex = math.clamp(nearestIndex, 1, #self.Frames)
+    self.CurrentTime = tonumber(self.Frames[self.PlaybackIndex].t) or 0
+    self.LastPlaybackFrameIndex = self.PlaybackIndex
+    self.LastM1State = false
+    self.IsLoopWaiting = false
+    self._PlaybackJumpPhase = false
+    self._LastPlaybackHumanoidState = nil
+
+    local firstFrame = self.Frames[self.PlaybackIndex]
+    local firstTarget = Vector3.new(
+        tonumber(firstFrame.px) or root.Position.X,
+        tonumber(firstFrame.py) or root.Position.Y,
+        tonumber(firstFrame.pz) or root.Position.Z
+    )
+
+    local recordHip = tonumber(firstFrame.hipHeight)
+    local playHip = tonumber(hum.HipHeight)
+    if recordHip and playHip then
+        firstTarget += Vector3.new(0, playHip - recordHip, 0)
+    end
+
+    -- AUTO ROUTE: metode diganti mengikuti pola kompetitor.
+    -- Tool sudah harus ter-equip sebelum speed route dibaca, sehingga
+    -- WalkSpeed dari coil/tool menjadi speed lari menuju route.
+    local function equipTool(toolName)
+        local currentTool = char:FindFirstChildOfClass("Tool")
+        if toolName then
+            if not currentTool or currentTool.Name ~= toolName then
+                local target = LocalPlayer.Backpack:FindFirstChild(toolName)
+                if target then
+                    pcall(function() hum:EquipTool(target) end)
+                end
+            end
+        elseif currentTool then
+            pcall(function() hum:UnequipTools() end)
+        end
+    end
+
+    equipTool(firstFrame.tool)
+
+    -- Beri satu kesempatan singkat agar Equipped/tool script menerapkan WalkSpeed.
+    task.wait()
+
+    -- AUTO ROUTE SPEED: gunakan WalkSpeed yang direkam di route.
+    -- Tool tetap di-equip seperti sebelumnya, tetapi speed approach tidak lagi
+    -- bergantung pada WalkSpeed Tool saat ini. Speed mengikuti data record.
+    local function getAutoRouteRecordedSpeed(index, fallback)
+        local frame = self.Frames[math.clamp(tonumber(index) or self.PlaybackIndex, 1, #self.Frames)]
+        local recordedSpeed = frame and tonumber(frame.walkSpeed) or nil
+        if recordedSpeed and recordedSpeed > 2 then
+            return recordedSpeed
+        end
+        return fallback or tonumber(self.Speed) or 16
+    end
+
+    local autoRouteRunSpeed = getAutoRouteRecordedSpeed(
+        self.PlaybackIndex,
+        tonumber(hum.WalkSpeed) or 16
+    )
+
+    local AUTO_ROUTE_STOP_DISTANCE = 3.5
+    local AUTO_ROUTE_ACCEPT_MULTIPLIER = 1.65
+    local AUTO_ROUTE_OVERSHOOT_MULTIPLIER = 2.4
+    local AUTO_ROUTE_LOOKAHEAD_FRAMES = 8
+    local AUTO_ROUTE_STUCK_SECONDS = 0.85
+    local AUTO_ROUTE_STUCK_MIN_MOVE = 0.75
+    local AUTO_ROUTE_RETARGET_SECONDS = 0.35
+
+    local function framePosition(index, fallback)
+        local frame = self.Frames[index]
+        if not frame then return fallback end
+        local pos = Vector3.new(
+            tonumber(frame.px) or fallback.X,
+            tonumber(frame.py) or fallback.Y,
+            tonumber(frame.pz) or fallback.Z
+        )
+        local recordHipValue = tonumber(frame.hipHeight)
+        local currentHipValue = tonumber(hum.HipHeight)
+        if recordHipValue and currentHipValue then
+            pos += Vector3.new(0, currentHipValue - recordHipValue, 0)
+        end
+        return pos
+    end
+
+    local routeTargetIndex = math.clamp(
+        self.PlaybackIndex + AUTO_ROUTE_LOOKAHEAD_FRAMES,
+        1,
+        math.max(1, #self.Frames - 1)
+    )
+    local routeTarget = framePosition(routeTargetIndex, firstTarget)
+    local approachDistance = (routeTarget - root.Position).Magnitude
+    local approachActive = approachDistance > AUTO_ROUTE_STOP_DISTANCE
+    local approachElapsed = 0
+    local approachStartClock = os.clock()
+    local approachLastRetarget = 0
+    local approachBestDistance = math.huge
+    local approachLastProgressPosition = root.Position
+    local approachLastProgressClock = os.clock()
+    local approachLastDirection = nil
+    local approachMaxTime = math.max(12, (approachDistance / math.max(autoRouteRunSpeed, 1)) + 4)
+
+    local oldWalkSpeed = hum.WalkSpeed
+    local oldAutoRotate = hum.AutoRotate
+    local oldUseJumpPower = hum.UseJumpPower
+    local oldJumpPower = hum.JumpPower
+    local oldJumpHeight = hum.JumpHeight
+    local oldPlatformStand = hum.PlatformStand
+
+    self._PlaybackRestore = {
+        Humanoid = hum,
+        Root = root,
+        WalkSpeed = oldWalkSpeed,
+        AutoRotate = oldAutoRotate,
+        UseJumpPower = oldUseJumpPower,
+        JumpPower = oldJumpPower,
+        JumpHeight = oldJumpHeight,
+        PlatformStand = oldPlatformStand
+    }
+
+    hum.AutoRotate = false
+    hum.PlatformStand = false
+
+    -- Playback normal tetap sederhana: timestamp menentukan frame A/B,
+    -- lalu Position + Rotation diinterpolasikan langsung.
+    local function clampMagnitude(v, maxMag)
+        if v.Magnitude > maxMag then
+            return v.Unit * maxMag
+        end
+        return v
+    end
+
+    local function angleDelta(a, b)
+        return math.atan2(math.sin(b - a), math.cos(b - a))
+    end
+
+    local function getYaw(frame, fallback)
+        local yaw = tonumber(frame and frame.rotation)
+        if yaw ~= nil then return yaw end
+        local lx = tonumber(frame and frame.lx) or 0
+        local lz = tonumber(frame and frame.lz) or 0
+        if math.abs(lx) > 0.000001 or math.abs(lz) > 0.000001 then
+            return math.atan2(-lx, -lz)
+        end
+        return fallback or 0
+    end
+
+    local function stateFromValue(value)
+        value = tonumber(value)
+        if not value then return nil end
+        for _, item in ipairs(Enum.HumanoidStateType:GetEnumItems()) do
+            if item.Value == value then return item end
+        end
+        return nil
+    end
+
+    -- V28.2: tahap normalisasi internal bergaya Onium.
+    -- Frame Record kita sudah mempunyai format yang stabil, jadi tahap ini
+    -- tidak mengubah data; ia hanya membentuk representasi playback yang sama:
+    -- pos + city/velocity + walkSpeed + rawState/rawJump + flags.
+    local function normalizePlaybackFrame(frame, fallbackPos)
+        fallbackPos = fallbackPos or root.Position
+        if type(frame) ~= "table" then
+            return {
+                t = 0,
+                pos = fallbackPos,
+                city = Vector3.zero,
+                velocity = 0,
+                walkSpeed = hum.WalkSpeed,
+                moveDirection = Vector3.zero,
+                rawState = "Running",
+                rawJump = false,
+                climbing = false,
+                jumping = false,
+                freefall = false,
+                sitting = false,
+                swimming = false,
+                state = "Running"
+            }
+        end
+
+        local pos = Vector3.new(
+            tonumber(frame.px) or fallbackPos.X,
+            tonumber(frame.py) or fallbackPos.Y,
+            tonumber(frame.pz) or fallbackPos.Z
+        )
+
+        local city = Vector3.new(
+            tonumber(frame.vx) or 0,
+            tonumber(frame.vy) or 0,
+            tonumber(frame.vz) or 0
+        )
+
+        local stateName = tostring(frame.state or "")
+        if stateName == "" then
+            local enumState = stateFromValue(frame.stateValue)
+            stateName = enumState and enumState.Name or tostring(frame.humanoidState or "Running")
+        end
+        stateName = stateName:gsub("Enum%.HumanoidStateType%.", "")
+
+        local rawState = tostring(frame.rawState or frame.humanoidState or stateName)
+        rawState = rawState:gsub("Enum%.HumanoidStateType%.", "")
+
+        local rawJump =
+            frame.rawJump == true
+            or frame.originalJump == true
+            or frame.jump == true
+
+        local jumping =
+            rawJump
+            or rawState == "Jumping"
+            or rawState == "Freefall"
+            or rawState == "FallingDown"
+
+        local moveDirection = Vector3.new(
+            tonumber(frame.mdx) or 0,
+            tonumber(frame.mdy) or 0,
+            tonumber(frame.mdz) or 0
+        )
+
+        return {
+            t = tonumber(frame.t) or 0,
+            pos = pos,
+            city = city,
+            velocity = Vector3.new(city.X, 0, city.Z).Magnitude,
+            walkSpeed = tonumber(frame.walkSpeed) or hum.WalkSpeed,
+            moveDirection = moveDirection,
+            hipHeight = tonumber(frame.hipHeight),
+            rawState = rawState,
+            rawJump = rawJump,
+            climbing = stateName == "Climbing",
+            jumping = jumping,
+            freefall = stateName == "Freefall" or stateName == "FallingDown",
+            sitting = stateName == "Seated" or stateName == "Sitting",
+            swimming = stateName == "Swimming",
+            state = stateName
+        }
+    end
+
+    local function playbackSmoothStep(alpha)
+        alpha = math.clamp(tonumber(alpha) or 0, 0, 1)
+        return alpha * alpha * (3 - (2 * alpha))
+    end
+
+    local function releaseMouse()
+        if self.LastM1State then
+            pcall(function()
+                VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 1)
+            end)
+            self.LastM1State = false
+        end
+    end
+
+    local function equipTool(toolName)
+        local currentTool = char:FindFirstChildOfClass("Tool")
+        if toolName then
+            if not currentTool or currentTool.Name ~= toolName then
+                local target = LocalPlayer.Backpack:FindFirstChild(toolName)
+                if target then
+                    pcall(function() hum:EquipTool(target) end)
+                end
+            end
+        elseif currentTool then
+            pcall(function() hum:UnequipTools() end)
+        end
+    end
+
+    local function restoreController()
+        releaseMouse()
+        pcall(function()
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+
+            hum.AutoRotate = oldAutoRotate
+            hum.PlatformStand = oldPlatformStand
+            hum.UseJumpPower = oldUseJumpPower
+            hum.JumpPower = oldJumpPower
+            hum.JumpHeight = oldJumpHeight
+            hum.WalkSpeed = oldWalkSpeed
+        end)
+        self._PlaybackRestore = nil
+    end
+
+    table.insert(self.Bin, RunService.Heartbeat:Connect(function(dt)
+        if hum.Health <= 0 or not char.Parent or not root.Parent then
+            restoreController()
+            self.State = "Idle"
+            self:CleanUp()
+            return
+        end
+
+        dt = math.clamp(dt, 1 / 240, 0.12)
+        self.LastPlaybackPosition = root.Position
+        self.LastPlaybackFrameIndex = self.PlaybackIndex
+
+        -- AUTO ROUTE: lari ke route dengan speed Tool/Playback yang stabil.
+        -- Target memakai lookahead + retarget, bukan easing/gain berbasis jarak.
+        if approachActive then
+            approachElapsed += dt
+
+            local currentPos = root.Position
+
+            -- Retarget berkala seperti metode kompetitor.
+            if os.clock() - approachLastRetarget >= AUTO_ROUTE_RETARGET_SECONDS then
+                approachLastRetarget = os.clock()
+
+                local nearestIndex = self.PlaybackIndex
+                local nearestDistance = math.huge
+                for i, frame in ipairs(self.Frames) do
+                    local px = tonumber(frame.px)
+                    local py = tonumber(frame.py)
+                    local pz = tonumber(frame.pz)
+                    if px and py and pz then
+                        local dx = px - currentPos.X
+                        local dy = py - currentPos.Y
+                        local dz = pz - currentPos.Z
+                        local d2 = dx * dx + dy * dy + dz * dz
+                        if d2 < nearestDistance then
+                            nearestDistance = d2
+                            nearestIndex = i
+                        end
+                    end
+                end
+
+                nearestDistance = math.sqrt(nearestDistance)
+                nearestIndex = math.clamp(nearestIndex, 1, math.max(1, #self.Frames - 1))
+
+                local acceptDistance = math.max(
+                    AUTO_ROUTE_STOP_DISTANCE,
+                    AUTO_ROUTE_STOP_DISTANCE * AUTO_ROUTE_ACCEPT_MULTIPLIER
+                )
+
+                if nearestDistance <= acceptDistance then
+                    -- Posisi aktual menjadi sumber baru untuk menentukan titik mulai.
+                    self.PlaybackIndex = nearestIndex
+                    self.CurrentTime = tonumber(self.Frames[nearestIndex].t) or self.CurrentTime
+                    approachActive = false
+                    approachElapsed = 0
+                    root.AssemblyLinearVelocity = Vector3.new(0, root.AssemblyLinearVelocity.Y, 0)
+                    root.AssemblyAngularVelocity = Vector3.zero
+                    return
+                end
+
+                if nearestIndex >= routeTargetIndex or nearestDistance + 2 < approachBestDistance then
+                    routeTargetIndex = math.clamp(
+                        nearestIndex + AUTO_ROUTE_LOOKAHEAD_FRAMES,
+                        1,
+                        math.max(1, #self.Frames - 1)
+                    )
+                    routeTarget = framePosition(routeTargetIndex, routeTarget)
+                end
+
+                -- Ikuti speed hasil record di sekitar titik route yang sedang
+                -- didekati. Ini membuat Auto Run menyesuaikan speed route
+                -- tanpa memakai speed berdasarkan jarak.
+                autoRouteRunSpeed = getAutoRouteRecordedSpeed(
+                    routeTargetIndex,
+                    autoRouteRunSpeed
+                )
+            end
+
+            local flatTarget = Vector3.new(routeTarget.X, currentPos.Y, routeTarget.Z)
+            local delta = flatTarget - currentPos
+            local dist = delta.Magnitude
+
+            if dist < approachBestDistance then
+                approachBestDistance = dist
+                approachLastProgressPosition = currentPos
+                approachLastProgressClock = os.clock()
+            end
+
+            local acceptDistance = math.max(
+                AUTO_ROUTE_STOP_DISTANCE,
+                AUTO_ROUTE_STOP_DISTANCE * AUTO_ROUTE_ACCEPT_MULTIPLIER
+            )
+            local overshootDistance = math.max(
+                acceptDistance + 1,
+                AUTO_ROUTE_STOP_DISTANCE * AUTO_ROUTE_OVERSHOOT_MULTIPLIER
+            )
+
+            -- Sudah cukup dekat: jangan dipaksa tepat 0 stud.
+            if dist <= acceptDistance then
+                self.PlaybackIndex = math.clamp(routeTargetIndex, 1, #self.Frames)
+                self.CurrentTime = tonumber(self.Frames[self.PlaybackIndex].t) or self.CurrentTime
+                approachActive = false
+                approachElapsed = 0
+                root.AssemblyLinearVelocity = Vector3.new(0, root.AssemblyLinearVelocity.Y, 0)
+                root.AssemblyAngularVelocity = Vector3.zero
+                return
+            end
+
+            -- Jika target sudah terlewati, jangan berbalik mengejar target lama.
+            if approachLastDirection and delta.Magnitude > 0.01 then
+                local nowDirection = delta.Unit
+                if approachLastDirection:Dot(nowDirection) < -0.15
+                    and approachBestDistance <= overshootDistance then
+                    approachActive = false
+                    approachElapsed = 0
+                    self.PlaybackIndex = math.clamp(routeTargetIndex, 1, #self.Frames)
+                    self.CurrentTime = tonumber(self.Frames[self.PlaybackIndex].t) or self.CurrentTime
+                    root.AssemblyLinearVelocity = Vector3.new(0, root.AssemblyLinearVelocity.Y, 0)
+                    root.AssemblyAngularVelocity = Vector3.zero
+                    return
+                end
+            end
+
+            -- Anti-stuck.
+            if os.clock() - approachLastProgressClock >= AUTO_ROUTE_STUCK_SECONDS then
+                local moved = (currentPos - approachLastProgressPosition).Magnitude
+                if moved <= AUTO_ROUTE_STUCK_MIN_MOVE
+                    or approachBestDistance <= overshootDistance * 1.75 then
+                    approachActive = false
+                    approachElapsed = 0
+                    self.PlaybackIndex = math.clamp(routeTargetIndex, 1, #self.Frames)
+                    self.CurrentTime = tonumber(self.Frames[self.PlaybackIndex].t) or self.CurrentTime
+                    root.AssemblyLinearVelocity = Vector3.new(0, root.AssemblyLinearVelocity.Y, 0)
+                    root.AssemblyAngularVelocity = Vector3.zero
+                    return
+                end
+                approachLastProgressPosition = currentPos
+                approachLastProgressClock = os.clock()
+            end
+
+            if os.clock() - approachStartClock > approachMaxTime then
+                approachActive = false
+                approachElapsed = 0
+                self.PlaybackIndex = math.clamp(routeTargetIndex, 1, #self.Frames)
+                self.CurrentTime = tonumber(self.Frames[self.PlaybackIndex].t) or self.CurrentTime
+                root.AssemblyLinearVelocity = Vector3.new(0, root.AssemblyLinearVelocity.Y, 0)
+                root.AssemblyAngularVelocity = Vector3.zero
+                return
+            end
+
+            local dir = dist > 0.001 and delta.Unit or Vector3.zero
+            approachLastDirection = dir
+
+            pcall(function()
+                hum.AutoRotate = true
+                hum.PlatformStand = false
+                hum.Sit = false
+                hum.Jump = false
+                hum:Move(dir, false)
+
+                -- Speed mengikuti WalkSpeed hasil record route.
+                -- Tidak ada speed scaling berdasarkan jarak.
+                hum.WalkSpeed = autoRouteRunSpeed
+
+                if dir.Magnitude > 0.01 then
+                    root.CFrame = CFrame.lookAt(
+                        root.Position,
+                        root.Position + Vector3.new(dir.X, 0, dir.Z)
+                    )
+                end
+
+                root.AssemblyLinearVelocity = Vector3.new(
+                    dir.X * autoRouteRunSpeed,
+                    root.AssemblyLinearVelocity.Y,
+                    dir.Z * autoRouteRunSpeed
+                )
+            end)
+
+            return
+        end
+
+        -- V25: PLAYBACK SEDERHANA / TIME = TIME RECORD
+        -- Tidak ada frame-lock, catch-up tambahan, sanitizer posisi, atau
+        -- pengali/pengurang speed. CurrentTime hanya berjalan mengikuti dt
+        -- playback dan posisi diinterpolasikan dari Position JSON.
+        local count = #self.Frames
+        local playbackSpeed = math.max(0, tonumber(self.Speed) or 1)
+
+        if count > 1 then
+            self.CurrentTime += math.max(0, dt) * playbackSpeed
+
+            local firstTime = tonumber(self.Frames[1].t) or 0
+            local lastTime = tonumber(self.Frames[count].t) or firstTime
+            self.CurrentTime = math.clamp(self.CurrentTime, firstTime, lastTime)
+        end
+
+        local lastFrame = self.Frames[count]
+        local lastTime = tonumber(lastFrame.t) or 0
+
+        if self.CurrentTime >= lastTime then
+            if self.LoopEnabled then
+                releaseMouse()
+                if self.LoopDelay > 0 then
+                    if not self.IsLoopWaiting then
+                        self.IsLoopWaiting = true
+                        self.LoopWaitStartTime = os.clock()
+                        root.AssemblyLinearVelocity = Vector3.zero
+                        root.AssemblyAngularVelocity = Vector3.zero
+                    elseif os.clock() - self.LoopWaitStartTime >= self.LoopDelay then
+                        self.IsLoopWaiting = false
+                        self.PlaybackIndex = 1
+                        self.CurrentTime = 0
+                        self._PlaybackSegmentIndex = nil
+                        self._PlaybackSegmentAlpha = 0
+                    end
+                    return
+                end
+                self.PlaybackIndex = 1
+                self.CurrentTime = 0
+                self._PlaybackSegmentIndex = nil
+                self._PlaybackSegmentAlpha = 0
+            else
+                restoreController()
+                self.State = "Idle"
+                self:CleanUp()
+                return
+            end
+        end
+
+        -- PLAYBACK V28: cari frame A/B berdasarkan timestamp dengan binary search.
+        -- Ini mengikuti pola time-driven: CurrentTime -> A/B -> alpha -> Position.
+        local i = math.clamp(self.PlaybackIndex or 1, 1, count)
+        if count > 1 then
+            local left = 1
+            local right = count - 1
+            while left <= right do
+                local mid = math.floor((left + right) / 2)
+                local midTime = tonumber(self.Frames[mid].t) or 0
+                local nextTime = tonumber(self.Frames[mid + 1].t) or midTime
+                if self.CurrentTime < midTime then
+                    right = mid - 1
+                elseif self.CurrentTime >= nextTime then
+                    left = mid + 1
+                else
+                    i = mid
+                    break
+                end
+            end
+            if left > right then
+                i = math.clamp(left, 1, count - 1)
+            end
+            self.PlaybackIndex = i
+        end
+
+        local a = self.Frames[i]
+        local b = self.Frames[math.min(i + 1, count)] or a
+
+        local t0 = tonumber(a.t) or 0
+        local t1 = tonumber(b.t) or t0
+        local segment = math.max(t1 - t0, 1 / 240)
+        local u = math.clamp((self.CurrentTime - t0) / segment, 0, 1)
+        -- Gunakan interpolasi posisi langsung dari frame rekaman.
+        -- Velocity JSON tetap dipakai sebagai informasi gerakan/state,
+        -- tetapi tidak dipakai sebagai tangent Hermite karena tangent yang
+        -- terlalu besar (terutama vy saat Freefall) dapat membuat karakter
+        -- tertarik, overshoot, lalu kembali naik.
+        local p0 = Vector3.new(
+            tonumber(a.px) or root.Position.X,
+            tonumber(a.py) or root.Position.Y,
+            tonumber(a.pz) or root.Position.Z
+        )
+        local p1 = Vector3.new(
+            tonumber(b.px) or p0.X,
+            tonumber(b.py) or p0.Y,
+            tonumber(b.pz) or p0.Z
+        )
+
+        -- V25: Position adalah sumber kebenaran route.
+        -- Tidak ada penambahan/pengurangan speed dan tidak ada sanitizer
+        -- yang mengubah posisi record. Velocity JSON tetap disimpan dan
+        -- dipakai apa adanya sebagai informasi gerakan.
+        local rawClimbP1 = p1
+        local rawClimbTargetPosition = p0:Lerp(rawClimbP1, u)
+        local rawClimbDesiredVelocity = (rawClimbP1 - p0) / segment
+
+        local targetPosition = p0:Lerp(p1, u)
+
+        -- Velocity route mentah hanya untuk sinyal Humanoid/Animate.
+        -- Tidak dihitung ulang dari posisi dan tidak diberi multiplier.
+        local recordedVelocity = Vector3.new(
+            tonumber(a.vx) or 0,
+            tonumber(a.vy) or 0,
+            tonumber(a.vz) or 0
+        )
+
+        local recordHip = tonumber(a.hipHeight)
+        local currentHip = tonumber(hum.HipHeight)
+        if recordHip and currentHip then
+            targetPosition += Vector3.new(0, currentHip - recordHip, 0)
+        end
+
+        equipTool(a.tool)
+        if a.walkSpeed ~= nil then
+            pcall(function() hum.WalkSpeed = tonumber(a.walkSpeed) or hum.WalkSpeed end)
+        end
+
+        local moveDirection = Vector3.new(
+            tonumber(a.mdx) or 0,
+            tonumber(a.mdy) or 0,
+            tonumber(a.mdz) or 0
+        )
+        local playbackState = stateFromValue(a.stateValue)
+
+        -- V27.14: jangan pre-apply Running/Landed saat keluar dari Fall.
+        -- State playback tetap diproses setelah route Position/Velocity dipasang,
+        -- sehingga Humanoid tidak sempat melakukan koreksi grounding yang dapat
+        -- menarik karakter sebelum frame fall/landing selesai.
+
+        local normalPlaybackStateApplied = false
+
+        -- CLIMB PLAYBACK PRESISI:
+        -- Climb menggunakan metode yang sama-sama berbasis TARGET POSITION
+        -- seperti playback route/jump, bukan controller velocity + tracking gain.
+        -- Ini mencegah physics Humanoid dan velocity climb saling menarik dengan
+        -- posisi record sehingga karakter terasa berat, overshoot, atau keluar rute.
+        local isClimbState =
+            playbackState == Enum.HumanoidStateType.Climbing
+            or tostring(a.state or ""):lower() == "climbing"
+
+        if isClimbState then
+            -- V28.9: METODE CLIMB KOMPETITOR.
+            pcall(function()
+                hum:ChangeState(Enum.HumanoidStateType.Climbing)
+            end)
+
+            local climbVerticalSpeed = math.abs(rawClimbDesiredVelocity.Y)
+            playClimbAnimation(
+                char,
+                hum,
+                climbVerticalSpeed
+            )
+
+            local climbYaw0 = getYaw(a, 0)
+            local climbYaw1 = getYaw(b, climbYaw0)
+            local climbYaw = climbYaw0 + angleDelta(climbYaw0, climbYaw1) * u
+
+            local timeDiff = math.max(
+                (tonumber(b.t) or 0) - (tonumber(a.t) or 0),
+                1 / 240
+            )
+
+            -- Kompetitor mengambil velocity dari frame B sebagai mapVel.
+            -- Jika velocity record kosong, gunakan velocity dari delta posisi.
+            local climbRecordedVelocity = Vector3.new(
+                tonumber(b.vx) or 0,
+                tonumber(b.vy) or 0,
+                tonumber(b.vz) or 0
+            )
+
+            local climbPositionVelocity = (p1 - p0) / timeDiff
+
+            if climbRecordedVelocity.Magnitude < 0.05 then
+                climbRecordedVelocity = climbPositionVelocity
+            end
+
+            local climbHorizontal = Vector3.new(
+                climbRecordedVelocity.X,
+                0,
+                climbRecordedVelocity.Z
+            )
+
+            local climbVertical = math.clamp(
+                climbRecordedVelocity.Y,
+                -50,
+                50
+            )
+
+            pcall(function()
+                root.CFrame =
+                    CFrame.new(rawClimbTargetPosition)
+                    * CFrame.Angles(0, climbYaw, 0)
+
+                root.AssemblyLinearVelocity = Vector3.new(
+                    climbHorizontal.X * 0.25,
+                    climbVertical,
+                    climbHorizontal.Z * 0.25
+                )
+                root.AssemblyAngularVelocity = Vector3.zero
+
+                hum.AutoRotate = false
+                hum.PlatformStand = false
+                hum.Sit = false
+                hum:Move(Vector3.zero, false)
+            end)
+
+            self._LastPlaybackHumanoidState =
+                Enum.HumanoidStateType.Climbing
+
+        else
+            -- V28.2 NORMAL PLAYBACK:
+            -- Satukan tahap yang memang dipakai Onium + KacungMarv untuk RUNNING:
+            --   1) normalisasi frame -> pos/city/walkSpeed/state
+            --   2) smooth alpha
+            --   3) Position tetap route authority
+            --   4) mapVel = recorded/city velocity
+            --   5) posDeltaVel = velocity dari route
+            --   6) mapVel diberi horizontal safety cap
+            --   7) MoveDirection mengikuti frame
+            -- Jump dan Climb tetap memakai metode Boneto sebelumnya.
+            if self._LastPlaybackHumanoidState == Enum.HumanoidStateType.Climbing
+                or activeClimbTrack
+            then
+                stopClimbPresentation(char)
+            end
+
+            local oa = normalizePlaybackFrame(a, root.Position)
+            local ob = normalizePlaybackFrame(b, oa.pos)
+
+            local eased = playbackSmoothStep(u)
+            local targetPos = oa.pos:Lerp(ob.pos, eased)
+
+            -- HipHeight correction Onium/KacungMarv.
+            local recHip = tonumber(ob.hipHeight) or tonumber(oa.hipHeight)
+            local curHip = tonumber(hum.HipHeight)
+            if recHip and curHip and recHip > 0 and curHip > 0 then
+                local yFix = curHip - recHip
+                if math.abs(yFix) <= 8 then
+                    targetPos = Vector3.new(targetPos.X, targetPos.Y + yFix, targetPos.Z)
+                end
+            end
+
+            local mapVel = oa.city:Lerp(ob.city, eased)
+            local segmentTime = math.max(t1 - t0, 0.001)
+            local posDeltaVel = (ob.pos - oa.pos) / segmentTime
+
+            local moveDir = oa.moveDirection:Lerp(ob.moveDirection, eased)
+
+            -- V28.4: tentukan lebih dulu apakah segment ini benar-benar
+            -- Jump/Freefall. Normal Running tidak boleh mengambil alih state
+            -- pada segment udara.
+            local rawStateA = tostring(oa.rawState or oa.state or "")
+                :gsub("Enum%.HumanoidStateType%.", "")
+            local rawStateB = tostring(ob.rawState or ob.state or "")
+                :gsub("Enum%.HumanoidStateType%.", "")
+
+            local segmentIsJumping =
+                oa.rawJump
+                or ob.rawJump
+                or rawStateA == "Jumping"
+                or rawStateB == "Jumping"
+                or rawStateA == "Freefall"
+                or rawStateB == "Freefall"
+                or rawStateA == "FallingDown"
+                or rawStateB == "FallingDown"
+
+            -- Safety cap hanya untuk NORMAL running.
+            -- Position tetap menjadi route authority.
+            local horizontalA = Vector3.new(oa.city.X, 0, oa.city.Z).Magnitude
+            local horizontalB = Vector3.new(ob.city.X, 0, ob.city.Z).Magnitude
+            local baseFrameSpeed = math.max(
+                tonumber(oa.walkSpeed) or 0,
+                tonumber(ob.walkSpeed) or 0,
+                playbackSpeed,
+                16
+            )
+            local maxLoopSafeSpeed = math.max(baseFrameSpeed * 1.12, 16)
+
+            local hVel = Vector3.new(mapVel.X, 0, mapVel.Z)
+            if hVel.Magnitude > maxLoopSafeSpeed and hVel.Magnitude > 0 then
+                hVel = hVel.Unit * maxLoopSafeSpeed
+            end
+
+            local yVel = math.clamp(mapVel.Y, -80, 80)
+
+            local yaw0 = getYaw(a, 0)
+            local yaw1 = getYaw(b, yaw0)
+            local yaw = yaw0 + angleDelta(yaw0, yaw1) * eased
+
+            pcall(function()
+                -- Route authority tetap sama: CFrame langsung ke target route.
+                root.CFrame =
+                    CFrame.new(targetPos)
+                    * CFrame.Angles(0, yaw, 0)
+
+                if moveDir.Magnitude > 0.01 then
+                    hum:Move(moveDir.Unit, true)
+                else
+                    hum:Move(Vector3.zero, false)
+                end
+
+                if not segmentIsJumping then
+                    -- Normal RUNNING: velocity hanya support.
+                    -- Batasi berdasarkan WalkSpeed, bukan raw velocity spike.
+                    root.AssemblyLinearVelocity =
+                        Vector3.new(hVel.X, yVel, hVel.Z)
+                    root.AssemblyAngularVelocity = Vector3.zero
+
+                    -- Pertahankan Running berdasarkan movement yang direkam, bukan hanya
+                    -- velocity hasil interpolasi yang bisa sesaat turun ke 0.
+                    -- Ini mencegah flicker Running <-> Standing yang terlihat seperti Idle.
+                    local recordedMoveMagnitude = moveDir.Magnitude
+                    local recordedHorizontalMotion = hVel.Magnitude
+                    local isRecordedMoving =
+                        recordedMoveMagnitude > 0.08
+                        or recordedHorizontalMotion > 0.45
+                        or oa.state == "Running"
+                        or ob.state == "Running"
+
+                    local normalState =
+                        isRecordedMoving
+                        and Enum.HumanoidStateType.Running
+                        or Enum.HumanoidStateType.Standing
+
+                    if normalState ~= self._LastPlaybackHumanoidState then
+                        hum:ChangeState(normalState)
+                        self._LastPlaybackHumanoidState = normalState
+                    end
+
+                    normalPlaybackStateApplied = true
+                end
+            end)
+        end
+
+        -- JUMP PRESISI / ANTI-FALSE-FREEFALL
+        -- Jangan memakai a.jump sebagai trigger dan jangan membuat Jumping
+        -- berulang-ulang. State tetap berasal dari rekaman, tetapi Freefall
+        -- yang muncul sesaat ketika karakter masih berada pada fase naik
+        -- diabaikan. Ini penting ketika jump dilakukan sangat cepat/spam.
+        local stateEnum = playbackState
+
+        local recordedVy0 = tonumber(a.vy)
+        local recordedVy1 = tonumber(b.vy)
+        local recordedVyNow = nil
+        if recordedVy0 ~= nil and recordedVy1 ~= nil then
+            recordedVyNow = recordedVy0 + (recordedVy1 - recordedVy0) * u
+        else
+            recordedVyNow = recordedVy0 or recordedVy1 or 0
+        end
+
+        local recordedY0 = tonumber(a.py)
+        local recordedY1 = tonumber(b.py)
+        local recordedYDelta = nil
+        if recordedY0 ~= nil and recordedY1 ~= nil then
+            recordedYDelta = recordedY1 - recordedY0
+        end
+
+        local isRecordedJump =
+            stateEnum == Enum.HumanoidStateType.Jumping
+            or self._LastPlaybackHumanoidState == Enum.HumanoidStateType.Jumping
+
+        local isRecordedFreefall =
+            stateEnum == Enum.HumanoidStateType.Freefall
+            or stateEnum == Enum.HumanoidStateType.FallingDown
+
+        -- Roblox kadang mengirim Freefall 1 frame lebih cepat daripada
+        -- lintasan rekaman. Selama vy masih positif (naik), atau posisi antar
+        -- frame masih naik, pertahankan Jumping. Begitu benar-benar mulai turun,
+        -- barulah Freefall boleh mengambil alih.
+        if isRecordedFreefall and isRecordedJump then
+            local stillAscending =
+                (recordedVyNow ~= nil and recordedVyNow > 0.05)
+                or (recordedYDelta ~= nil and recordedYDelta > 0.001)
+
+            -- Jangan mempromosikan Freefall kembali menjadi Jumping setelah
+            -- playback sudah memasuki fase udara. Velocity tetap diterapkan,
+            -- tetapi tidak boleh membuat transisi Jumping kedua.
+            if stillAscending
+                and self._LastPlaybackHumanoidState ~= Enum.HumanoidStateType.Jumping
+                and self._LastPlaybackHumanoidState ~= Enum.HumanoidStateType.Freefall
+            then
+                stateEnum = Enum.HumanoidStateType.Jumping
+            end
+        elseif stateEnum == Enum.HumanoidStateType.Freefall
+            and recordedVyNow ~= nil
+            and recordedVyNow > 0.05
+            and self._LastPlaybackHumanoidState ~= Enum.HumanoidStateType.Jumping
+            and self._LastPlaybackHumanoidState ~= Enum.HumanoidStateType.Freefall
+        then
+            -- Fallback hanya sebelum fase udara sudah dimulai.
+            stateEnum = Enum.HumanoidStateType.Jumping
+        end
+
+        -- METODE JUMP REFERENSI KOMPETITOR:
+        -- Jump hanya dipicu ketika playback BARU MASUK ke state Jumping.
+        -- Jangan memicu Jumping berulang pada setiap frame.
+        -- Saat Freefall, hanya state playback yang diterapkan.
+        if stateEnum == Enum.HumanoidStateType.Jumping then
+            local enteringJump =
+                self._LastPlaybackHumanoidState ~= Enum.HumanoidStateType.Jumping
+
+            -- Start the jump only once when playback first enters Jumping.
+            -- Recorded AssemblyLinearVelocity (including Y) remains responsible
+            -- for the actual jump trajectory on subsequent frames.
+            if enteringJump then
+                pcall(function()
+                    hum:ChangeState(Enum.HumanoidStateType.Jumping)
+                end)
+            end
+
+            self._LastPlaybackHumanoidState = Enum.HumanoidStateType.Jumping
+
+        elseif stateEnum == Enum.HumanoidStateType.Freefall
+            or stateEnum == Enum.HumanoidStateType.FallingDown
+        then
+            if stateEnum ~= self._LastPlaybackHumanoidState then
+                pcall(function()
+                    hum:ChangeState(stateEnum)
+                end)
+                self._LastPlaybackHumanoidState = stateEnum
+            end
+
+        elseif not normalPlaybackStateApplied
+            and stateEnum
+            and stateEnum ~= self._LastPlaybackHumanoidState
+        then
+            -- State normal tetap diterapkan setelah route Position/Velocity.
+            pcall(function()
+                hum:ChangeState(stateEnum)
+            end)
+            self._LastPlaybackHumanoidState = stateEnum
+        end
+
+        if a.m1 ~= nil then
+            if a.m1 and not self.LastM1State then
+                pcall(function()
+                    VirtualInputManager:SendMouseButtonEvent(0, 0, 0, true, game, 1)
+                end)
+                self.LastM1State = true
+            elseif not a.m1 and self.LastM1State then
+                releaseMouse()
+            end
+        end
+    end))
+end
+function MacroEngine:Stop()
+    local wasRec = (self.State == "Recording")
+    local restore = self._PlaybackRestore
+
+    -- Hentikan playback lebih dulu agar Heartbeat tidak menulis velocity lagi.
+    self.State = "Idle"
+    self._PlaybackRestore = nil
+
+    local charBeforeStop = LocalPlayer.Character
+    local humBeforeStop = charBeforeStop and charBeforeStop:FindFirstChildOfClass("Humanoid")
+    local rootBeforeStop = charBeforeStop and charBeforeStop:FindFirstChild("HumanoidRootPart")
+    local wasClimbingAtStop =
+        self._LastPlaybackHumanoidState == Enum.HumanoidStateType.Climbing
+        or activeClimbTrack ~= nil
+
+    -- Ambil CFrame PERSIS pada saat tombol STOP ditekan.
+    -- Nilai ini akan dipasang kembali setelah CleanUp supaya reset state
+    -- Humanoid tidak menggeser karakter dari posisi terakhir playback.
+    local stopCFrame = rootBeforeStop and rootBeforeStop.CFrame or nil
+    local stopPosition = rootBeforeStop and rootBeforeStop.Position or nil
+
+    -- STOP saat CLIMB harus melepaskan presentation/track climb.
+    -- Jangan freeze atau memutar ulang track setelah STOP karena track Action
+    -- yang masih aktif dapat membuat karakter tetap terlihat seperti sedang
+    -- climb ketika pemain mulai bergerak manual keluar dari rute.
+    stopClimbPresentation(charBeforeStop)
+
+    self:CleanUp()
+
+    local char = LocalPlayer.Character
+    local hum = (char and char:FindFirstChildOfClass("Humanoid")) or (restore and restore.Humanoid)
+    local root = (char and char:FindFirstChild("HumanoidRootPart")) or (restore and restore.Root)
+
+    if root then
+        self.LastPlaybackPosition = stopPosition or root.Position
+        self.LastPlaybackFrameIndex = self.PlaybackIndex
+
+        -- Kunci kembali posisi/orientasi yang benar-benar terlihat ketika STOP.
+        -- Ini penting khususnya saat Climb karena physics dapat mengubah CFrame
+        -- pada satu atau dua heartbeat setelah state Climbing dilepas.
+        if stopCFrame then
+            pcall(function()
+                root.CFrame = stopCFrame
+            end)
+        end
+
+        pcall(function()
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end)
+    end
+
+    if hum then
+        pcall(function()
+            hum.PlatformStand = false
+
+            if restore then
+                hum.AutoRotate = restore.AutoRotate
+                hum.UseJumpPower = restore.UseJumpPower
+                hum.JumpPower = restore.JumpPower
+                hum.JumpHeight = restore.JumpHeight
+                hum.PlatformStand = restore.PlatformStand
+                hum.WalkSpeed = restore.WalkSpeed
+            end
+
+            -- Jangan memaksa state GettingUp/Running saat STOP.
+            -- Biarkan Humanoid + Animate mengambil alih transisi secara natural.
+            -- Posisi terakhir tetap dipertahankan oleh koreksi CFrame di bawah.
+            task.defer(function()
+                if root and root.Parent and stopCFrame and self.State == "Idle" then
+                    pcall(function()
+                        root.CFrame = stopCFrame
+                        root.AssemblyLinearVelocity = Vector3.zero
+                        root.AssemblyAngularVelocity = Vector3.zero
+                    end)
+                end
+            end)
+        end)
+    end
+
+    -- Animate tetap aktif. Tidak ada freeze/Anchored/PlatformStand.
+    pcall(function()
+        local animate = char and char:FindFirstChild("Animate")
+        if animate then
+            animate.Disabled = false
+        end
+    end)
+
+    -- Satu koreksi akhir setelah Animate/state transition agar posisi STOP
+    -- tetap persis pada CFrame yang ditangkap saat tombol STOP ditekan.
+    if root and stopCFrame then
+        task.defer(function()
+            if root and root.Parent and self.State == "Idle" then
+                pcall(function()
+                    root.CFrame = stopCFrame
+                    root.AssemblyLinearVelocity = Vector3.zero
+                    root.AssemblyAngularVelocity = Vector3.zero
+                end)
+            end
+        end)
+    end
+
+    return wasRec
+end
+
+pcall(function() FSM:Init() end)
+
+-- [ V10 DIAGNOSTIC ]
+-- Pastikan eksekusi mencapai bagian UI tanpa mengubah engine Playback.
+local UI_BOOT_OK = true
+
+-- [ PERANCANGAN ULANG UI - PREMIUM DAN ELEGAN ]
+local UI = {
+    Parent =
+        pcall(function()
+            return CoreGui.Name
+        end)
+        and CoreGui
+        or LocalPlayer:WaitForChild("PlayerGui")
+}
+
+if UI.Parent:FindFirstChild("boneto_premium") then
+    UI.Parent.boneto_premium:Destroy()
+end
+
+local function ApplyCorner(obj, rad)
+    Instance.new("UICorner", obj).CornerRadius =
+        UDim.new(0, rad)
+end
+
+local function ApplyStroke(obj, color, thick)
+    local s = Instance.new("UIStroke", obj)
+    s.Color = THEME.BrightRed
+    s.Thickness = thick
+    s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    s.LineJoinMode = Enum.LineJoinMode.Round
+    return s
+end
+
+local ScreenGui = Instance.new("ScreenGui")
+
+ScreenGui.Name = "boneto_premium"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.ZIndexBehavior =
+    Enum.ZIndexBehavior.Sibling
+ScreenGui.Parent = UI.Parent
+
+-- Tombol buka atau perkecil GUI
+-- Muncul di bagian atas layar sebagai bilah BONETO horizontal yang dapat digeser.
+local OpenBtn =
+    Instance.new("TextButton", ScreenGui)
+
+OpenBtn.Size =
+    UDim2.new(0, 140, 0, 36)
+
+OpenBtn.Position =
+    UDim2.new(0.5, -70, 0, 12)
+
+-- Latar putih untuk tombol BONETO yang diperkecil.
+OpenBtn.BackgroundColor3 =
+    Color3.fromRGB(0, 0, 0)
+OpenBtn.BackgroundTransparency = 0.6
+
+OpenBtn.BorderSizePixel = 0
+OpenBtn.Text = "+ B O N E T O +"
+-- Pertahankan warna teks dan jenis huruf tebal seperti semula.
+OpenBtn.TextColor3 = THEME.BrightRed
+OpenBtn.TextColor3 = THEME.BrightRed
+OpenBtn.TextTransparency = 0
+OpenBtn.TextSize = 14
+OpenBtn.Font = Enum.Font.GothamBold
+OpenBtn.AutoButtonColor = false
+OpenBtn.Visible = false
+OpenBtn.ZIndex = 200
+OpenBtn.Active = true
+
+ApplyCorner(OpenBtn, 10)
+ApplyStroke(OpenBtn, THEME.BrightRed, 1.8)
+
+Instance.new("UIGradient", OpenBtn).Color =
+    ColorSequence.new({
+        ColorSequenceKeypoint.new(
+            0,
+            Color3.fromRGB(255, 255, 255)
+        ),
+        ColorSequenceKeypoint.new(
+            1,
+            Color3.fromRGB(255, 255, 255)
+        )
+    })
+
+-- Jendela utama
+local MainFrame =
+    Instance.new("Frame", ScreenGui)
+
+MainFrame.Size =
+    UDim2.new(0, 680, 0, 480)
+
+MainFrame.Position =
+    UDim2.new(0.5, -340, 0.5, -240)
+
+-- GUI utama berwarna hitam dengan transparansi latar 50%.
+MainFrame.BackgroundColor3 =
+    Color3.fromRGB(0, 0, 0)
+MainFrame.BackgroundTransparency = 0.7
+
+MainFrame.BorderSizePixel = 0
+MainFrame.Active = true
+MainFrame.ClipsDescendants = false
+
+ApplyCorner(MainFrame, 12)
+ApplyStroke(MainFrame, THEME.BrightRed, 1.8)
+
+-- Bayangan jendela
+local DropShadow =
+    Instance.new("ImageLabel", MainFrame)
+
+DropShadow.AnchorPoint =
+    Vector2.new(0.5, 0.5)
+
+DropShadow.Position =
+    UDim2.new(0.5, 0, 0.5, 8)
+
+DropShadow.Size =
+    UDim2.new(1, 60, 1, 60)
+
+DropShadow.BackgroundTransparency = 1
+
+DropShadow.ZIndex = -1
+
+DropShadow.Image =
+    "rbxassetid://6015897843"
+
+DropShadow.ImageTransparency = 0.3
+DropShadow.ImageColor3 =
+    Color3.new(0, 0, 0)
+
+DropShadow.ScaleType =
+    Enum.ScaleType.Slice
+
+DropShadow.SliceCenter =
+    Rect.new(49, 49, 450, 450)
+
+-- Bagian kepala jendela
+local Header =
+    Instance.new("Frame", MainFrame)
+
+Header.Size =
+    UDim2.new(1, 0, 0, 45)
+
+Header.BackgroundTransparency = 1
+
+local HeaderStroke =
+    Instance.new("Frame", Header)
+
+HeaderStroke.Size =
+    UDim2.new(1, 0, 0, 1)
+
+HeaderStroke.Position =
+    UDim2.new(0, 0, 1, 0)
+
+HeaderStroke.BackgroundColor3 =
+    THEME.BrightRed
+
+HeaderStroke.BorderSizePixel = 0
+
+local HeaderGradient =
+    Instance.new("UIGradient", HeaderStroke)
+
+HeaderGradient.Color =
+    ColorSequence.new(THEME.BrightRed)
+
+local Title =
+    Instance.new("TextLabel", Header)
+
+Title.Size =
+    UDim2.new(1, -100, 1, 0)
+
+Title.Position =
+    UDim2.new(0, 20, 0, 0)
+
+Title.BackgroundTransparency = 1
+
+Title.Text =
+    "B O N E T O  | P A N E L"
+
+Title.TextColor3 = THEME.TextWhite
+
+Title.Font =
+    Enum.Font.GothamBlack
+
+Title.TextSize = 13
+Title.TextXAlignment =
+    Enum.TextXAlignment.Left
+
+local function CreateHeaderBtn(pos, txt, color)
+    local b =
+        Instance.new("TextButton", Header)
+
+    b.Size =
+        UDim2.new(0, 28, 0, 28)
+
+    b.Position = pos
+    b.BackgroundTransparency = 1
+    b.Text = txt
+    b.TextColor3 = THEME.TextWhite
+    b.TextColor3 = THEME.TextWhite
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 14
+
+    ApplyCorner(b, 8)
+
+    local s =
+        ApplyStroke(
+            b,
+            THEME.Outline,
+            1
+        )
+
+    b.MouseEnter:Connect(function()
+        TweenService:Create(
+            b,
+            TweenInfo.new(0.2),
+            {
+                BackgroundTransparency = 0.8,
+                BackgroundColor3 = color
+            }
+        ):Play()
+
+        TweenService:Create(
+            s,
+            TweenInfo.new(0.2),
+            {
+                Color = THEME.BrightRed
+            }
+        ):Play()
+    end)
+
+    b.MouseLeave:Connect(function()
+        TweenService:Create(
+            b,
+            TweenInfo.new(0.2),
+            {
+                BackgroundTransparency = 1
+            }
+        ):Play()
+
+        TweenService:Create(
+            s,
+            TweenInfo.new(0.2),
+            {
+                Color = THEME.BrightRed
+            }
+        ):Play()
+    end)
+
+    return b
+end
+
+local MinBtn =
+    CreateHeaderBtn(
+        UDim2.new(1, -75, 0.5, -14),
+        "-",
+        THEME.TextWhite
+    )
+
+local CloseBtn =
+    CreateHeaderBtn(
+        UDim2.new(1, -40, 0.5, -14),
+        "X",
+        THEME.Action.Record
+    )
+
+-- Bilah samping
+local Sidebar =
+    Instance.new("Frame", MainFrame)
+
+Sidebar.Size =
+    UDim2.new(0, 180, 1, -46)
+
+Sidebar.Position =
+    UDim2.new(0, 0, 0, 46)
+
+Sidebar.BackgroundTransparency = 1
+
+local SidebarStroke =
+    Instance.new("Frame", Sidebar)
+
+SidebarStroke.Size =
+    UDim2.new(0, 1, 1, 0)
+
+SidebarStroke.Position =
+    UDim2.new(1, 0, 0, 0)
+
+SidebarStroke.BackgroundColor3 =
+    THEME.Outline
+
+SidebarStroke.BorderSizePixel = 0
+
+local ProfileFrame =
+    Instance.new("Frame", Sidebar)
+
+ProfileFrame.Size =
+    UDim2.new(1, -20, 0, 50)
+
+ProfileFrame.Position =
+    UDim2.new(0, 10, 0, 15)
+
+ProfileFrame.BackgroundColor3 =
+    THEME.PanelDark
+
+ProfileFrame.BackgroundTransparency = 0.3
+
+ApplyCorner(ProfileFrame, 8)
+ApplyStroke(ProfileFrame, THEME.BrightRed, 1)
+
+local AvatarImg =
+    Instance.new("ImageLabel", ProfileFrame)
+
+AvatarImg.Size =
+    UDim2.new(0, 34, 0, 34)
+
+AvatarImg.Position =
+    UDim2.new(0, 8, 0.5, -17)
+
+AvatarImg.BackgroundTransparency = 1
+
+AvatarImg.Image =
+    Players:GetUserThumbnailAsync(
+        LocalPlayer.UserId,
+        Enum.ThumbnailType.HeadShot,
+        Enum.ThumbnailSize.Size420x420
+    )
+
+ApplyCorner(AvatarImg, 17)
+ApplyStroke(AvatarImg, THEME.BrightRed, 1.5)
+
+local NameText =
+    Instance.new("TextLabel", ProfileFrame)
+
+NameText.Size =
+    UDim2.new(1, -50, 0, 14)
+
+NameText.Position =
+    UDim2.new(0, 50, 0.5, -16)
+
+NameText.BackgroundTransparency = 1
+
+NameText.Text =
+    string.sub(
+        LocalPlayer.DisplayName,
+        1,
+        12
+    )
+
+NameText.TextColor3 = THEME.TextWhite
+
+NameText.Font =
+    Enum.Font.GothamBold
+
+NameText.TextSize = 13
+NameText.TextXAlignment =
+    Enum.TextXAlignment.Left
+
+local UserText =
+    Instance.new("TextLabel", ProfileFrame)
+
+UserText.Size =
+    UDim2.new(1, -50, 0, 12)
+
+UserText.Position =
+    UDim2.new(0, 50, 0.5, 4)
+
+UserText.BackgroundTransparency = 1
+
+UserText.Text =
+    "@"
+    .. string.sub(
+        LocalPlayer.Name,
+        1,
+        12
+    )
+
+UserText.TextColor3 = THEME.TextWhite
+
+UserText.Font =
+    Enum.Font.GothamMedium
+
+UserText.TextSize = 10
+UserText.TextXAlignment =
+    Enum.TextXAlignment.Left
+
+local TabContainer =
+    Instance.new("ScrollingFrame", Sidebar)
+
+TabContainer.Size =
+    UDim2.new(1, -20, 1, -90)
+
+TabContainer.Position =
+    UDim2.new(0, 10, 0, 80)
+
+TabContainer.BackgroundTransparency = 1
+TabContainer.BorderSizePixel = 0
+TabContainer.ScrollBarThickness = 3
+TabContainer.ScrollBarImageColor3 = THEME.Accent
+TabContainer.CanvasSize = UDim2.new(0, 0, 0, 0)
+TabContainer.AutomaticCanvasSize = Enum.AutomaticSize.Y
+
+local TabListLayout =
+    Instance.new(
+        "UIListLayout",
+        TabContainer
+    )
+
+TabListLayout.Padding =
+    UDim.new(0, 8)
+
+local ContentArea =
+    Instance.new("Frame", MainFrame)
+
+ContentArea.Size =
+    UDim2.new(1, -181, 1, -46)
+
+ContentArea.Position =
+    UDim2.new(0, 181, 0, 46)
+
+ContentArea.BackgroundTransparency = 1
+
+local Tabs = {}
+
+local function CreateTab(name, id)
+    local btn =
+        Instance.new(
+            "TextButton",
+            TabContainer
+        )
+
+    btn.Size =
+        UDim2.new(1, 0, 0, 36)
+
+    btn.BackgroundTransparency = 1
+    btn.Text = "   " .. name
+    btn.TextColor3 = THEME.TextWhite
+    btn.TextColor3 = THEME.TextWhite
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 13
+    btn.TextXAlignment =
+        Enum.TextXAlignment.Left
+
+    ApplyCorner(btn, 8)
+
+    local frame =
+        Instance.new(
+            "Frame",
+            ContentArea
+        )
+
+    frame.Size =
+        UDim2.new(1, -30, 1, -30)
+
+    frame.Position =
+        UDim2.new(0, 15, 0, 15)
+
+    frame.BackgroundTransparency = 1
+    frame.Visible = false
+
+    Tabs[id] = {
+        Btn = btn,
+        Frame = frame
+    }
+
+    btn.MouseButton1Click:Connect(function()
+        for tId, tData in pairs(Tabs) do
+            if tId == id then
+                tData.Frame.Visible = true
+
+                tData.Btn.BackgroundColor3 = THEME.AccentDark
+                tData.Btn.BackgroundTransparency = 0.2
+                tData.Btn.TextColor3 = THEME.TextWhite
+            else
+                tData.Frame.Visible = false
+
+                tData.Btn.BackgroundTransparency = 1
+                tData.Btn.TextColor3 = THEME.TextWhite
+            end
+        end
+    end)
+
+    return frame
+end
+
+local TabAutoWalk =
+    CreateTab(
+        "AUTOWALK",
+        "autowalk"
+    )
+
+local TabPlayer =
+    CreateTab(
+        "PLAYER",
+        "player"
+    )
+
+local TabPerformance =
+    CreateTab(
+        "PERFORMANCE",
+        "performance"
+    )
+
+local TabSettings =
+    CreateTab(
+        "SETTINGS",
+        "settings"
+    )
+
+local function CreateButton(
+    parent,
+    text,
+    color,
+    layoutOrder
+)
+    local btn =
+        Instance.new(
+            "TextButton",
+            parent
+        )
+
+    btn.Size =
+        UDim2.new(1, 0, 0, 38)
+
+    btn.BackgroundTransparency = 0.8
+    btn.BackgroundColor3 = color
+    btn.LayoutOrder = layoutOrder
+    btn.Text = text
+    btn.TextColor3 = THEME.TextWhite
+    btn.TextColor3 = THEME.TextWhite
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 12
+    btn.AutoButtonColor = false
+
+    ApplyCorner(btn, 6)
+
+    local s =
+        ApplyStroke(
+            btn,
+            color,
+            1
+        )
+
+    btn.MouseEnter:Connect(function()
+        TweenService:Create(
+            btn,
+            TweenInfo.new(0.2),
+            {
+                BackgroundTransparency = 0,
+                TextColor3 = THEME.TextWhite
+            }
+        ):Play()
+    end)
+
+    btn.MouseLeave:Connect(function()
+        TweenService:Create(
+            btn,
+            TweenInfo.new(0.2),
+            {
+                BackgroundTransparency = 0.8,
+                TextColor3 = THEME.TextWhite
+            }
+        ):Play()
+    end)
+
+    return btn
+end
+
+-- Keterangan fungsi.
+
+local AWLeft =
+    Instance.new(
+        "Frame",
+        TabAutoWalk
+    )
+
+AWLeft.Size =
+    UDim2.new(0.5, -8, 1, 0)
+
+AWLeft.BackgroundTransparency = 1
+
+local AWLeftLayout =
+    Instance.new(
+        "UIListLayout",
+        AWLeft
+    )
+
+AWLeftLayout.Padding =
+    UDim.new(0, 6)
+
+AWLeftLayout.SortOrder =
+    Enum.SortOrder.LayoutOrder
+
+local AWRight =
+    Instance.new(
+        "Frame",
+        TabAutoWalk
+    )
+
+AWRight.Size =
+    UDim2.new(0.5, -8, 1, 0)
+
+AWRight.Position =
+    UDim2.new(0.5, 16, 0, 0)
+
+AWRight.BackgroundColor3 =
+    THEME.PanelDark
+
+AWRight.BackgroundTransparency = 0.5
+
+ApplyCorner(AWRight, 8)
+ApplyStroke(AWRight, THEME.Outline, 1)
+
+local StatusPanel =
+    Instance.new(
+        "TextLabel",
+        AWLeft
+    )
+
+StatusPanel.Size =
+    UDim2.new(1, 0, 0, 36)
+
+StatusPanel.Visible = false
+
+StatusPanel.BackgroundTransparency = 0.7
+
+StatusPanel.BackgroundColor3 =
+    THEME.PanelDark
+
+StatusPanel.LayoutOrder = 1
+
+StatusPanel.Text =
+    "Status: Idle"
+
+StatusPanel.TextColor3 = THEME.TextWhite
+
+StatusPanel.Font =
+    Enum.Font.GothamBold
+
+StatusPanel.TextSize = 13
+
+ApplyCorner(StatusPanel, 6)
+ApplyStroke(StatusPanel, THEME.Outline, 1)
+
+local RecordBtn =
+    CreateButton(
+        AWLeft,
+        "RECORDER",
+        THEME.Action.Record,
+        2
+    )
+
+local PlayBtn =
+    CreateButton(
+        AWLeft,
+        "PLAY MACRO",
+        THEME.Action.Play,
+        3
+    )
+
+PlayBtn.Visible = false
+
+local PlaybackBtn =
+    CreateButton(
+        AWLeft,
+        "PLAYBACK",
+        THEME.Action.Play,
+        2
+    )
+
+-- Panel Recorder mengambang untuk Record, Stop, Save, dan Delete.
+local RecorderGui =
+    Instance.new("Frame", ScreenGui)
+
+RecorderGui.Name = "RecorderGui"
+RecorderGui.Size = UDim2.new(0, 240, 0, 180)
+RecorderGui.Position = UDim2.new(0, 10, 0.5, -105)
+RecorderGui.BackgroundColor3 = THEME.PanelDark
+RecorderGui.BackgroundTransparency = 0.12
+RecorderGui.BorderSizePixel = 0
+RecorderGui.Visible = false
+RecorderGui.ZIndex = 250
+RecorderGui.Active = true
+RecorderGui.ClipsDescendants = false
+ApplyCorner(RecorderGui, 10)
+ApplyStroke(RecorderGui, THEME.BrightRed, 1.5)
+
+local RecorderTitle = Instance.new("TextLabel", RecorderGui)
+RecorderTitle.Size = UDim2.new(1, -38, 0, 20)
+RecorderTitle.Position = UDim2.new(0, 9, 0, 3)
+RecorderTitle.BackgroundTransparency = 1
+RecorderTitle.Text = "RECORDER"
+RecorderTitle.TextColor3 = THEME.TextWhite
+RecorderTitle.Font = Enum.Font.GothamBold
+RecorderTitle.TextSize = 10
+RecorderTitle.TextXAlignment = Enum.TextXAlignment.Left
+RecorderTitle.ZIndex = 251
+
+local RecorderClose = Instance.new("TextButton", RecorderGui)
+RecorderClose.Size = UDim2.new(0, 20, 0, 20)
+RecorderClose.Position = UDim2.new(1, -25, 0, 1)
+RecorderClose.BackgroundTransparency = 1
+RecorderClose.Text = "X"
+RecorderClose.TextColor3 = THEME.TextWhite
+RecorderClose.Font = Enum.Font.GothamBold
+RecorderClose.TextSize = 12
+RecorderClose.ZIndex = 252
+
+local RecorderButtons = Instance.new("Frame", RecorderGui)
+RecorderButtons.Size = UDim2.new(1, -14, 0, 26)
+RecorderButtons.Position = UDim2.new(0, 7, 0, 25)
+RecorderButtons.BackgroundTransparency = 1
+RecorderButtons.ZIndex = 251
+
+local RecorderButtonLayout = Instance.new("UIListLayout", RecorderButtons)
+RecorderButtonLayout.FillDirection = Enum.FillDirection.Horizontal
+RecorderButtonLayout.Padding = UDim.new(0, 5)
+RecorderButtonLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+local RecorderRecordBtn = CreateButton(RecorderButtons, "RECORD: OFF", THEME.Action.Record, 1)
+RecorderRecordBtn.Size = UDim2.new(0.5, -3, 1, 0)
+RecorderRecordBtn.ZIndex = 252
+
+local RecorderUndoBtn = CreateButton(RecorderButtons, "UNDO", THEME.Action.Pause, 2)
+RecorderUndoBtn.Size = UDim2.new(0.5, -3, 1, 0)
+RecorderUndoBtn.ZIndex = 252
+
+local RecorderPlayButtons = Instance.new("Frame", RecorderGui)
+RecorderPlayButtons.Size = UDim2.new(1, -14, 0, 26)
+RecorderPlayButtons.Position = UDim2.new(0, 7, 0, 56)
+RecorderPlayButtons.BackgroundTransparency = 1
+RecorderPlayButtons.ZIndex = 251
+
+local RecorderPlayBtn = CreateButton(RecorderPlayButtons, "PLAY: OFF", THEME.Action.Play, 1)
+RecorderPlayBtn.Size = UDim2.new(1, 0, 1, 0)
+RecorderPlayBtn.ZIndex = 252
+
+local RecorderFileActions = Instance.new("Frame", RecorderGui)
+RecorderFileActions.Size = UDim2.new(1, -14, 0, 26)
+RecorderFileActions.Position = UDim2.new(0, 7, 0, 118)
+RecorderFileActions.BackgroundTransparency = 1
+RecorderFileActions.ZIndex = 251
+
+local RecorderFileLayout = Instance.new("UIListLayout", RecorderFileActions)
+RecorderFileLayout.FillDirection = Enum.FillDirection.Horizontal
+RecorderFileLayout.Padding = UDim.new(0, 5)
+RecorderFileLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+local RecorderSaveBtn = CreateButton(RecorderFileActions, "SAVE", THEME.Action.Play, 1)
+RecorderSaveBtn.Size = UDim2.new(0.5, -3, 1, 0)
+RecorderSaveBtn.ZIndex = 252
+
+local RecorderDeleteBtn = CreateButton(RecorderFileActions, "DELETE", THEME.Action.Delete, 2)
+RecorderDeleteBtn.Size = UDim2.new(0.5, -3, 1, 0)
+RecorderDeleteBtn.ZIndex = 252
+
+local RecorderStatus = Instance.new("TextLabel", RecorderGui)
+RecorderStatus.Size = UDim2.new(1, -14, 0, 26)
+RecorderStatus.Position = UDim2.new(0, 7, 0, 146)
+RecorderStatus.BackgroundTransparency = 1
+RecorderStatus.Text = "Status: Idle"
+RecorderStatus.TextColor3 = THEME.TextWhite
+RecorderStatus.Font = Enum.Font.GothamMedium
+RecorderStatus.TextSize = 10
+RecorderStatus.TextXAlignment = Enum.TextXAlignment.Center
+RecorderStatus.TextYAlignment = Enum.TextYAlignment.Center
+RecorderStatus.TextWrapped = true
+RecorderStatus.ZIndex = 251
+
+-- Panel Recorder dapat digeser dengan menyeret judul.
+do
+    local dragging = false
+    local dragStart = nil
+    local startPosition = nil
+    local dragInput = nil
+
+    local function updateRecorderDrag(input)
+        local delta = input.Position - dragStart
+        RecorderGui.Position = UDim2.new(
+            startPosition.X.Scale,
+            startPosition.X.Offset + delta.X,
+            startPosition.Y.Scale,
+            startPosition.Y.Offset + delta.Y
+        )
+    end
+
+    RecorderTitle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPosition = RecorderGui.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+
+    RecorderTitle.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if input == dragInput and dragging then
+            updateRecorderDrag(input)
+        end
+    end)
+end
+
+RecorderClose.MouseButton1Click:Connect(function()
+    RecorderGui.Visible = false
+end)
+
+-- Panel Playback mengambang agar Play/Stop tetap mudah diakses
+-- ketika GUI utama disembunyikan.
+local PlaybackGui =
+    Instance.new("Frame", ScreenGui)
+
+PlaybackGui.Name = "PlaybackGui"
+PlaybackGui.Size = UDim2.new(0, 190, 0, 58)
+PlaybackGui.Position = UDim2.new(0.5, -95, 0.5, 180)
+PlaybackGui.BackgroundColor3 = THEME.PanelDark
+PlaybackGui.BackgroundTransparency = 0.15
+PlaybackGui.BorderSizePixel = 0
+PlaybackGui.Visible = false
+PlaybackGui.ZIndex = 250
+PlaybackGui.Active = true
+PlaybackGui.ClipsDescendants = false
+ApplyCorner(PlaybackGui, 10)
+
+ApplyStroke(PlaybackGui, THEME.BrightRed, 1.5)
+
+local PlaybackTitle =
+    Instance.new("TextLabel", PlaybackGui)
+PlaybackTitle.Size = UDim2.new(1, -38, 0, 18)
+PlaybackTitle.Position = UDim2.new(0, 10, 0, 4)
+PlaybackTitle.BackgroundTransparency = 1
+PlaybackTitle.Text = "PLAYBACK"
+PlaybackTitle.TextColor3 = THEME.TextWhite
+PlaybackTitle.Font = Enum.Font.GothamBold
+PlaybackTitle.TextSize = 11
+PlaybackTitle.TextXAlignment = Enum.TextXAlignment.Left
+PlaybackTitle.ZIndex = 251
+
+-- Membuat panel Playback dapat digeser dengan menyeret bagian judul.
+do
+    local dragging = false
+    local dragStart = nil
+    local startPosition = nil
+    local dragInput = nil
+
+    local function updatePlaybackDrag(input)
+        local delta = input.Position - dragStart
+        PlaybackGui.Position = UDim2.new(
+            startPosition.X.Scale,
+            startPosition.X.Offset + delta.X,
+            startPosition.Y.Scale,
+            startPosition.Y.Offset + delta.Y
+        )
+    end
+
+    PlaybackTitle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPosition = PlaybackGui.Position
+
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+
+    PlaybackTitle.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if input == dragInput and dragging then
+            updatePlaybackDrag(input)
+        end
+    end)
+end
+
+local PlaybackClose =
+    Instance.new("TextButton", PlaybackGui)
+PlaybackClose.Size = UDim2.new(0, 24, 0, 24)
+PlaybackClose.Position = UDim2.new(1, -29, 0, 1)
+PlaybackClose.BackgroundTransparency = 1
+PlaybackClose.Text = "X"
+PlaybackClose.TextColor3 = THEME.TextWhite
+PlaybackClose.Font = Enum.Font.GothamBold
+PlaybackClose.TextSize = 14
+PlaybackClose.ZIndex = 252
+
+local PlaybackButtons =
+    Instance.new("Frame", PlaybackGui)
+PlaybackButtons.Size = UDim2.new(1, -16, 0, 28)
+PlaybackButtons.Position = UDim2.new(0, 8, 0, 25)
+PlaybackButtons.BackgroundTransparency = 1
+PlaybackButtons.ZIndex = 251
+
+local PlaybackLayout = Instance.new("UIListLayout", PlaybackButtons)
+PlaybackLayout.FillDirection = Enum.FillDirection.Horizontal
+PlaybackLayout.Padding = UDim.new(0, 8)
+PlaybackLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+local FloatingPlayBtn = CreateButton(
+    PlaybackButtons,
+    "PLAY",
+    THEME.Action.Play,
+    1
+)
+FloatingPlayBtn.Size = UDim2.new(0.5, -4, 1, 0)
+FloatingPlayBtn.ZIndex = 252
+
+local FloatingVisualBtn = CreateButton(
+    PlaybackButtons,
+    "VISUAL: OFF",
+    THEME.Action.Pause,
+    2
+)
+FloatingVisualBtn.Size = UDim2.new(0.5, -4, 1, 0)
+FloatingVisualBtn.ZIndex = 252
+
+PlaybackBtn.MouseButton1Click:Connect(function()
+    PlaybackGui.Visible = not PlaybackGui.Visible
+end)
+
+PlaybackClose.MouseButton1Click:Connect(function()
+    PlaybackGui.Visible = false
+end)
+
+FloatingPlayBtn.MouseButton1Click:Connect(function()
+    if MacroEngine.State == "Recording" then
+        return
+    end
+
+    if MacroEngine.State == "Playing" then
+        MacroEngine:Stop()
+        FloatingPlayBtn.Text = "PLAY: OFF"
+    else
+        if #MacroEngine.Frames == 0 then
+            return
+        end
+
+        MacroEngine:Play()
+        FloatingPlayBtn.Text = "PLAY: ON"
+    end
+end)
+
+local function SetPlaybackPanelLocked(locked)
+    locked = locked == true
+
+    local function setButtonState(button, disabled)
+        if not button then
+            return
+        end
+
+        button.Active = not disabled
+        button.AutoButtonColor = not disabled
+        button.Selectable = not disabled
+
+        local stroke = button:FindFirstChildOfClass("UIStroke")
+        if stroke then
+            stroke.Transparency = disabled and 0.45 or 0
+        end
+    end
+
+    setButtonState(FloatingPlayBtn, locked)
+    setButtonState(FloatingVisualBtn, locked)
+
+    if PlaybackGui then
+        PlaybackGui:SetAttribute("ControlsLocked", locked)
+    end
+end
+
+local function SetVisualPath(enabled)
+    if MacroEngine.State == "Recording" then
+        return
+    end
+
+    enabled = enabled == true
+
+    -- Satu sumber status Visual.
+    MacroEngine.ShowPath = enabled
+
+    -- Selalu hapus visual lama terlebih dahulu.
+    pcall(function()
+        if MacroEngine.PathFolder then
+            MacroEngine.PathFolder:Destroy()
+        end
+    end)
+    MacroEngine.PathFolder = nil
+
+    pcall(function()
+        local oldVisual = workspace:FindFirstChild("boneto_VisualPath")
+        if oldVisual then
+            oldVisual:Destroy()
+        end
+    end)
+
+    -- Saat ON, gambar ulang dari Frames yang saat ini aktif.
+    if enabled and type(MacroEngine.Frames) == "table" and #MacroEngine.Frames >= 2 then
+        pcall(function()
+            MacroEngine:RenderPath(#MacroEngine.Frames)
+        end)
+    end
+
+    -- Sinkronkan tampilan tombol Playback.
+    if FloatingVisualBtn then
+        FloatingVisualBtn.Text = enabled and "VISUAL: ON" or "VISUAL: OFF"
+
+        local stroke = FloatingVisualBtn:FindFirstChildOfClass("UIStroke")
+        if stroke then
+            stroke.Color = enabled and THEME.Action.Pause or THEME.Outline
+        end
+    end
+end
+
+if FloatingVisualBtn then
+    FloatingVisualBtn.MouseButton1Click:Connect(function()
+        if MacroEngine.State == "Recording" then
+            return
+        end
+
+        SetVisualPath(not (MacroEngine.ShowPath == true))
+    end)
+end
+
+SetPlaybackPanelLocked(false)
+SetVisualPath(false)
+
+-- STOP dan SAVE sengaja dibuat sebagai kontrol terpisah.
+local StopSaveFrame =
+    Instance.new(
+        "Frame",
+        AWLeft
+    )
+
+StopSaveFrame.Size =
+    UDim2.new(1, 0, 0, 38)
+
+StopSaveFrame.BackgroundTransparency = 1
+StopSaveFrame.LayoutOrder = 99
+StopSaveFrame.Visible = false
+
+local StopSaveLayout =
+    Instance.new(
+        "UIListLayout",
+        StopSaveFrame
+    )
+
+StopSaveLayout.FillDirection =
+    Enum.FillDirection.Horizontal
+
+StopSaveLayout.Padding =
+    UDim.new(0, 8)
+
+local StopBtn =
+    CreateButton(
+        StopSaveFrame,
+        "STOP",
+        THEME.Action.Stop,
+        1
+    )
+
+StopBtn.Size =
+    UDim2.new(0.5, -4, 1, 0)
+
+local SaveBtn =
+    CreateButton(
+        StopSaveFrame,
+        "SAVE",
+        THEME.Action.Play,
+        2
+    )
+
+SaveBtn.Size =
+    UDim2.new(0.5, -4, 1, 0)
+
+local SpeedFrame =
+    Instance.new(
+        "Frame",
+        AWLeft
+    )
+
+SpeedFrame.Size =
+    UDim2.new(1, 0, 0, 38)
+
+SpeedFrame.BackgroundColor3 =
+    THEME.PanelDark
+
+SpeedFrame.BackgroundTransparency = 0.5
+SpeedFrame.LayoutOrder = 4
+
+ApplyCorner(SpeedFrame, 6)
+ApplyStroke(SpeedFrame, THEME.Outline, 1)
+
+local SpeedMin =
+    Instance.new(
+        "TextButton",
+        SpeedFrame
+    )
+
+SpeedMin.Size =
+    UDim2.new(0.25, 0, 1, 0)
+
+SpeedMin.BackgroundTransparency = 1
+SpeedMin.Text = "-"
+SpeedMin.TextColor3 = THEME.TextWhite
+SpeedMin.Font =
+    Enum.Font.GothamBold
+SpeedMin.TextSize = 20
+
+local SpeedMax =
+    Instance.new(
+        "TextButton",
+        SpeedFrame
+    )
+
+SpeedMax.Size =
+    UDim2.new(0.25, 0, 1, 0)
+
+SpeedMax.Position =
+    UDim2.new(0.75, 0, 0, 0)
+
+SpeedMax.BackgroundTransparency = 1
+SpeedMax.Text = "+"
+SpeedMax.TextColor3 = THEME.TextWhite
+SpeedMax.Font =
+    Enum.Font.GothamBold
+SpeedMax.TextSize = 20
+
+local SpeedText =
+    Instance.new(
+        "TextLabel",
+        SpeedFrame
+    )
+
+SpeedText.Size =
+    UDim2.new(0.5, 0, 1, 0)
+
+SpeedText.Position =
+    UDim2.new(0.25, 0, 0, 0)
+
+SpeedText.BackgroundTransparency = 1
+SpeedText.Text = "Speed: 1.0x"
+SpeedText.TextColor3 = THEME.TextWhite
+SpeedText.Font =
+    Enum.Font.GothamMedium
+SpeedText.TextSize = 13
+
+local FileTitle =
+    Instance.new(
+        "TextLabel",
+        AWRight
+    )
+
+FileTitle.Size =
+    UDim2.new(1, 0, 0, 30)
+
+FileTitle.BackgroundTransparency = 1
+FileTitle.Text = "SAVED MACROS"
+FileTitle.TextColor3 = THEME.TextWhite
+FileTitle.Font =
+    Enum.Font.GothamBold
+FileTitle.TextSize = 12
+
+local FileScroll =
+    Instance.new(
+        "ScrollingFrame",
+        AWRight
+    )
+
+FileScroll.Size =
+    UDim2.new(1, -20, 1, -125)
+
+FileScroll.Position =
+    UDim2.new(0, 10, 0, 30)
+
+FileScroll.BackgroundTransparency = 1
+FileScroll.ScrollBarThickness = 3
+FileScroll.ScrollBarImageColor3 =
+    THEME.Accent
+
+FileScroll.CanvasSize =
+    UDim2.new(0, 0, 0, 0)
+
+FileScroll.AutomaticCanvasSize =
+    Enum.AutomaticSize.Y
+
+local ScrollLayout =
+    Instance.new(
+        "UIListLayout",
+        FileScroll
+    )
+
+ScrollLayout.Padding =
+    UDim.new(0, 6)
+
+local FileInput =
+    Instance.new(
+        "TextBox",
+        RecorderGui
+    )
+
+FileInput.Size =
+    UDim2.new(1, -14, 0, 26)
+
+FileInput.Position =
+    UDim2.new(0, 7, 0, 88)
+
+FileInput.BackgroundColor3 =
+    THEME.BaseDark
+
+FileInput.BackgroundTransparency = 0.5
+FileInput.TextColor3 = THEME.TextWhite
+
+FileInput.PlaceholderText =
+    "Enter File Name..."
+
+FileInput.PlaceholderColor3 =
+    THEME.TextGray
+
+FileInput.Font =
+    Enum.Font.GothamMedium
+
+FileInput.TextSize = 11
+
+ApplyCorner(FileInput, 6)
+ApplyStroke(FileInput, THEME.Outline, 1)
+
+local RefreshFilesBtn =
+    CreateButton(
+        AWRight,
+        "REFRESH FILES",
+        THEME.Action.Play,
+        0
+    )
+
+RefreshFilesBtn.Size =
+    UDim2.new(1, -20, 0, 36)
+
+RefreshFilesBtn.Position =
+    UDim2.new(0, 10, 1, -88)
+RefreshFilesBtn.Visible = true
+
+local DelBtn =
+    CreateButton(
+        AWRight,
+        "DELETE SELECTED",
+        THEME.Action.Delete,
+        0
+    )
+
+DelBtn.Size =
+    UDim2.new(1, -20, 0, 36)
+
+DelBtn.Position =
+    UDim2.new(0, 10, 1, -44)
+DelBtn.Visible = true
+
+-- Keterangan fungsi.
+
+local PerfLayout =
+    Instance.new(
+        "UIListLayout",
+        TabPerformance
+    )
+
+PerfLayout.Padding =
+    UDim.new(0, 10)
+
+PerfLayout.SortOrder =
+    Enum.SortOrder.LayoutOrder
+
+local PerformanceBtn =
+    CreateButton(
+        TabPerformance,
+        "PERFORMANCE MONITOR: OFF",
+        THEME.Action.Play,
+        1
+    )
+
+local GraphicsBtn =
+    CreateButton(
+        TabPerformance,
+        "GRAPHICS 0.8X: OFF",
+        THEME.Action.Play,
+        2
+    )
+
+local performanceGui =
+    Instance.new("ScreenGui")
+
+performanceGui.Name =
+    "BONETOPerformanceMonitor"
+
+performanceGui.ResetOnSpawn = false
+performanceGui.IgnoreGuiInset = true
+performanceGui.DisplayOrder = 201
+performanceGui.Enabled = false
+performanceGui.Parent = UI.Parent
+
+local performanceFrame =
+    Instance.new("Frame")
+
+-- Monitor performa berada tepat di bawah bilah BONETO yang diperkecil.
+performanceFrame.Size =
+    UDim2.new(0, 160, 0, 50)
+
+performanceFrame.Position =
+    UDim2.new(0.5, -80, 0, 54)
+
+performanceFrame.BackgroundColor3 =
+    THEME.BaseDark
+
+performanceFrame.BackgroundTransparency = 0.12
+performanceFrame.BorderSizePixel = 0
+performanceFrame.Active = true
+performanceFrame.Selectable = true
+performanceFrame.ZIndex = 210
+performanceFrame.Parent =
+    performanceGui
+
+ApplyCorner(performanceFrame, 9)
+ApplyStroke(
+    performanceFrame,
+    THEME.BrightRed,
+    1.8
+)
+
+local fpsLabel =
+    Instance.new(
+        "TextLabel",
+        performanceFrame
+    )
+
+fpsLabel.Size =
+    UDim2.new(1, -12, 0, 24)
+
+fpsLabel.Position =
+    UDim2.new(0, 6, 0, 1)
+
+fpsLabel.BackgroundTransparency = 1
+fpsLabel.Text = "FPS: --"
+fpsLabel.TextColor3 = THEME.TextWhite
+fpsLabel.Font =
+    Enum.Font.GothamBold
+fpsLabel.TextSize = 16
+fpsLabel.TextXAlignment =
+    Enum.TextXAlignment.Center
+fpsLabel.ZIndex = 211
+
+local pingLabel =
+    Instance.new(
+        "TextLabel",
+        performanceFrame
+    )
+
+pingLabel.Size =
+    UDim2.new(1, -12, 0, 24)
+
+pingLabel.Position =
+    UDim2.new(0, 6, 0, 25)
+
+pingLabel.BackgroundTransparency = 1
+pingLabel.Text = "PING: --ms"
+pingLabel.TextColor3 = THEME.TextWhite
+pingLabel.Font =
+    Enum.Font.GothamBold
+pingLabel.TextSize = 16
+pingLabel.TextXAlignment =
+    Enum.TextXAlignment.Center
+pingLabel.ZIndex = 211
+
+-- Monitor performa mengikuti bilah BONETO yang diperkecil sampai
+-- pengguna memindahkannya secara manual ke tempat lain.
+local performanceFollowMini = true
+
+local performanceDragging = false
+local performanceDragInput = nil
+local performanceDragStart = nil
+local performanceStartPos = nil
+
+local function SetPerformanceBelowMini()
+    local miniPos = OpenBtn.Position
+
+    performanceFrame.Position =
+        UDim2.new(
+            miniPos.X.Scale,
+            miniPos.X.Offset,
+            miniPos.Y.Scale,
+            miniPos.Y.Offset + OpenBtn.Size.Y.Offset + 60
+        )
+end
+
+SetPerformanceBelowMini()
+
+performanceFrame.InputBegan:Connect(function(input)
+    if
+        input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch
+    then
+        performanceDragging = true
+        performanceFollowMini = false
+        performanceDragStart = input.Position
+        performanceStartPos = performanceFrame.Position
+
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                performanceDragging = false
+            end
+        end)
+    end
+end)
+
+performanceFrame.InputChanged:Connect(function(input)
+    if
+        input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch
+    then
+        performanceDragInput = input
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if
+        input == performanceDragInput
+        and performanceDragging
+    then
+        local delta =
+            input.Position - performanceDragStart
+
+        performanceFrame.Position =
+            UDim2.new(
+                performanceStartPos.X.Scale,
+                performanceStartPos.X.Offset + delta.X,
+                performanceStartPos.Y.Scale,
+                performanceStartPos.Y.Offset + delta.Y
+            )
+    end
+end)
+
+local performanceEnabled = false
+
+PerformanceBtn.MouseButton1Click:Connect(function()
+    performanceEnabled =
+        not performanceEnabled
+
+    PerformanceBtn.Text =
+        "PERFORMANCE MONITOR: "
+        .. (
+            performanceEnabled
+            and "ON"
+            or "OFF"
+        )
+
+    PerformanceBtn.TextColor3 = THEME.TextWhite
+
+    PerformanceBtn.UIStroke.Color =
+        performanceEnabled
+        and THEME.Accent
+        or THEME.Outline
+
+    performanceGui.Enabled =
+        performanceEnabled
+end)
+
+
+local graphicsEnabled = false
+
+local graphicsSaved =
+    setmetatable(
+        {},
+        {
+            __mode = "k"
+        }
+    )
+
+local function saveGraphicsProperty(
+    obj,
+    property
+)
+    if not obj then
+        return
+    end
+
+    if graphicsSaved[obj] == nil then
+        graphicsSaved[obj] = {}
+    end
+
+    if graphicsSaved[obj][property] == nil then
+        local ok, value =
+            pcall(function()
+                return obj[property]
+            end)
+
+        if ok then
+            graphicsSaved[obj][property] =
+                value
+        end
+    end
+end
+
+local function setGraphicsProperty(
+    obj,
+    property,
+    value
+)
+    pcall(function()
+        obj[property] = value
+    end)
+end
+
+local function optimizeGraphicsObject(obj)
+    if obj:IsA("BasePart") then
+        saveGraphicsProperty(
+            obj,
+            "CastShadow"
+        )
+
+        setGraphicsProperty(
+            obj,
+            "CastShadow",
+            false
+        )
+    end
+
+    if obj:IsA("MeshPart") then
+        saveGraphicsProperty(
+            obj,
+            "RenderFidelity"
+        )
+
+        setGraphicsProperty(
+            obj,
+            "RenderFidelity",
+            Enum.RenderFidelity.Performance
+        )
+    end
+
+    if
+        obj:IsA("ParticleEmitter")
+        or obj:IsA("Trail")
+        or obj:IsA("Beam")
+        or obj:IsA("Smoke")
+        or obj:IsA("Fire")
+        or obj:IsA("Sparkles")
+    then
+        saveGraphicsProperty(
+            obj,
+            "Enabled"
+        )
+
+        setGraphicsProperty(
+            obj,
+            "Enabled",
+            false
+        )
+    end
+
+    if
+        obj:IsA("BloomEffect")
+        or obj:IsA("BlurEffect")
+        or obj:IsA("ColorCorrectionEffect")
+        or obj:IsA("DepthOfFieldEffect")
+        or obj:IsA("SunRaysEffect")
+    then
+        saveGraphicsProperty(
+            obj,
+            "Enabled"
+        )
+
+        setGraphicsProperty(
+            obj,
+            "Enabled",
+            false
+        )
+    end
+
+    if
+        obj:IsA("PointLight")
+        or obj:IsA("SpotLight")
+        or obj:IsA("SurfaceLight")
+    then
+        saveGraphicsProperty(
+            obj,
+            "Enabled"
+        )
+
+        setGraphicsProperty(
+            obj,
+            "Enabled",
+            false
+        )
+    end
+end
+
+local function optimizeGraphics()
+    saveGraphicsProperty(
+        Lighting,
+        "GlobalShadows"
+    )
+
+    setGraphicsProperty(
+        Lighting,
+        "GlobalShadows",
+        false
+    )
+
+    local terrain =
+        workspace:FindFirstChildOfClass(
+            "Terrain"
+        )
+
+    if terrain then
+        for _, property in ipairs({
+            "WaterWaveSize",
+            "WaterWaveSpeed",
+            "WaterReflectance",
+            "WaterTransparency"
+        }) do
+            saveGraphicsProperty(
+                terrain,
+                property
+            )
+        end
+
+        setGraphicsProperty(
+            terrain,
+            "WaterWaveSize",
+            0
+        )
+
+        setGraphicsProperty(
+            terrain,
+            "WaterWaveSpeed",
+            0
+        )
+
+        setGraphicsProperty(
+            terrain,
+            "WaterReflectance",
+            0
+        )
+
+        setGraphicsProperty(
+            terrain,
+            "WaterTransparency",
+            1
+        )
+    end
+
+    for _, obj in ipairs(
+        game:GetDescendants()
+    ) do
+        optimizeGraphicsObject(obj)
+    end
+end
+
+local function restoreGraphics()
+    for obj, properties in pairs(
+        graphicsSaved
+    ) do
+        if obj and obj.Parent then
+            for property, value in pairs(
+                properties
+            ) do
+                setGraphicsProperty(
+                    obj,
+                    property,
+                    value
+                )
+            end
+        end
+    end
+
+    table.clear(graphicsSaved)
+end
+
+game.DescendantAdded:Connect(function(obj)
+    if graphicsEnabled then
+        task.defer(function()
+            if
+                graphicsEnabled
+                and obj.Parent
+            then
+                optimizeGraphicsObject(obj)
+            end
+        end)
+    end
+end)
+
+GraphicsBtn.MouseButton1Click:Connect(function()
+    graphicsEnabled =
+        not graphicsEnabled
+
+    GraphicsBtn.Text =
+        "GRAPHICS 0.8X: "
+        .. (
+            graphicsEnabled
+            and "ON"
+            or "OFF"
+        )
+
+    GraphicsBtn.TextColor3 = THEME.TextWhite
+
+    GraphicsBtn.UIStroke.Color =
+        graphicsEnabled
+        and THEME.Accent
+        or THEME.Outline
+
+    if graphicsEnabled then
+        optimizeGraphics()
+    else
+        restoreGraphics()
+    end
+end)
+
+-- Keterangan fungsi.
+
+local PlayerLayout =
+    Instance.new(
+        "UIListLayout",
+        TabPlayer
+    )
+
+PlayerLayout.Padding =
+    UDim.new(0, 10)
+
+PlayerLayout.SortOrder =
+    Enum.SortOrder.LayoutOrder
+
+local ESPBtn =
+    CreateButton(
+        TabPlayer,
+        "ESP: OFF",
+        THEME.Accent,
+        1
+    )
+
+local InfJumpBtn =
+    CreateButton(
+        TabPlayer,
+        "INFINITE JUMP: OFF",
+        THEME.Accent,
+        2
+    )
+
+local NoclipBtn =
+    CreateButton(
+        TabPlayer,
+        "NOCLIP: OFF",
+        THEME.Accent,
+        3
+    )
+
+local HidePlayersBtn =
+    CreateButton(
+        TabPlayer,
+        "HIDE ALL PLAYER: OFF",
+        THEME.Accent,
+        4
+    )
+
+-- Compact player toggle rows.
+local PlayerToggleRow1 = Instance.new("Frame", TabPlayer)
+PlayerToggleRow1.Size = UDim2.new(1, 0, 0, 38)
+PlayerToggleRow1.BackgroundTransparency = 1
+PlayerToggleRow1.LayoutOrder = 1
+
+local PlayerToggleRow2 = Instance.new("Frame", TabPlayer)
+PlayerToggleRow2.Size = UDim2.new(1, 0, 0, 38)
+PlayerToggleRow2.BackgroundTransparency = 1
+PlayerToggleRow2.LayoutOrder = 2
+
+for _, btn in ipairs({ESPBtn, NoclipBtn}) do
+    btn.Parent = PlayerToggleRow1
+    btn.Size = UDim2.new(0.5, -3, 1, 0)
+end
+ESPBtn.Position = UDim2.new(0, 0, 0, 0)
+NoclipBtn.Position = UDim2.new(0.5, 3, 0, 0)
+
+for _, btn in ipairs({InfJumpBtn, HidePlayersBtn}) do
+    btn.Parent = PlayerToggleRow2
+    btn.Size = UDim2.new(0.5, -3, 1, 0)
+end
+InfJumpBtn.Position = UDim2.new(0, 0, 0, 0)
+HidePlayersBtn.Position = UDim2.new(0.5, 3, 0, 0)
+
+ESPBtn.Text = "ESP: OFF"
+NoclipBtn.Text = "NO CLIP: OFF"
+InfJumpBtn.Text = "INFINITE JUMP: OFF"
+HidePlayersBtn.Text = "HIDE ALL PLAYER: OFF"
+
+local WalkSpeedLabel =
+    Instance.new(
+        "TextLabel",
+        TabPlayer
+    )
+
+WalkSpeedLabel.Size =
+    UDim2.new(1, 0, 0, 20)
+
+WalkSpeedLabel.BackgroundTransparency = 1
+
+WalkSpeedLabel.Text =
+    "Walkspeed (1-200)"
+
+WalkSpeedLabel.TextColor3 = THEME.TextWhite
+
+WalkSpeedLabel.Font =
+    Enum.Font.GothamBold
+
+WalkSpeedLabel.TextSize = 12
+
+WalkSpeedLabel.TextXAlignment =
+    Enum.TextXAlignment.Left
+
+WalkSpeedLabel.LayoutOrder = 5
+
+local WalkSpeedActions =
+    Instance.new(
+        "Frame",
+        TabPlayer
+    )
+
+WalkSpeedActions.Size =
+    UDim2.new(1, 0, 0, 36)
+
+WalkSpeedActions.BackgroundTransparency = 1
+WalkSpeedActions.LayoutOrder = 6
+
+local WalkSpeedBox =
+    Instance.new(
+        "TextBox",
+        WalkSpeedActions
+    )
+
+WalkSpeedBox.Size =
+    UDim2.new(0.46, -4, 1, 0)
+
+WalkSpeedBox.Position =
+    UDim2.new(0, 0, 0, 0)
+
+WalkSpeedBox.BackgroundColor3 =
+    THEME.PanelDark
+
+WalkSpeedBox.BackgroundTransparency = 0.3
+WalkSpeedBox.BorderSizePixel = 0
+WalkSpeedBox.TextColor3 = THEME.TextWhite
+
+WalkSpeedBox.PlaceholderColor3 =
+    THEME.TextGray
+
+WalkSpeedBox.PlaceholderText =
+    "Enter Speed"
+
+WalkSpeedBox.Text = ""
+
+WalkSpeedBox.Font =
+    Enum.Font.GothamMedium
+
+WalkSpeedBox.TextSize = 12
+WalkSpeedBox.ClearTextOnFocus = false
+
+ApplyCorner(WalkSpeedBox, 6)
+ApplyStroke(
+    WalkSpeedBox,
+    THEME.Outline,
+    1
+)
+
+local SetWalkSpeedBtn =
+    CreateButton(
+        WalkSpeedActions,
+        "SET",
+        THEME.Accent,
+        1
+    )
+
+SetWalkSpeedBtn.Size =
+    UDim2.new(0.25, -4, 1, 0)
+
+SetWalkSpeedBtn.Position =
+    UDim2.new(0.46, 2, 0, 0)
+
+local ResetWalkSpeedBtn =
+    CreateButton(
+        WalkSpeedActions,
+        "RESET",
+        THEME.Accent,
+        2
+    )
+
+ResetWalkSpeedBtn.Size =
+    UDim2.new(0.29, -2, 1, 0)
+
+ResetWalkSpeedBtn.Position =
+    UDim2.new(0.71, 2, 0, 0)
+
+local ESPEnabled,
+    InfiniteJumpEnabled,
+    NoclipEnabled,
+    HidePlayersEnabled =
+    false,
+    false,
+    false,
+    false
+
+local function getHumanoid()
+    local character =
+        LocalPlayer.Character
+
+    return character
+        and character:FindFirstChildOfClass(
+            "Humanoid"
+        )
+end
+
+SetWalkSpeedBtn.MouseButton1Click:Connect(function()
+    local value =
+        tonumber(WalkSpeedBox.Text)
+
+    if value and value >= 1 and value <= 200 then
+        local humanoid =
+            getHumanoid()
+
+        if humanoid then
+            humanoid.WalkSpeed = value
+        end
+
+        WalkSpeedBox.PlaceholderText =
+            "Enter speed..."
+    else
+        WalkSpeedBox.Text = ""
+
+        WalkSpeedBox.PlaceholderText =
+            "Enter 1–200!"
+    end
+end)
+
+ResetWalkSpeedBtn.MouseButton1Click:Connect(function()
+    local humanoid =
+        getHumanoid()
+
+    if humanoid then
+        humanoid.WalkSpeed = 16
+    end
+
+    WalkSpeedBox.Text = ""
+
+    WalkSpeedBox.PlaceholderText =
+        "Enter speed..."
+end)
+
+
+-- =========================================================
+-- FLY GUI + FLY ENGINE
+-- Isolated so Fly errors cannot stop the main GUI initialization.
+-- Method: LinearVelocity + Attachment, noclip, camera-relative movement,
+-- Space/C vertical movement, upright orientation. No per-frame animation freeze.
+-- =========================================================
+local FlyLabel =
+    Instance.new(
+        "TextLabel",
+        TabPlayer
+    )
+
+FlyLabel.Size = UDim2.new(1, 0, 0, 20)
+FlyLabel.BackgroundTransparency = 1
+FlyLabel.Text = "FLY (1-200)"
+FlyLabel.TextColor3 = THEME.TextWhite
+FlyLabel.Font = Enum.Font.GothamBold
+FlyLabel.TextSize = 12
+FlyLabel.TextXAlignment = Enum.TextXAlignment.Left
+FlyLabel.LayoutOrder = 7
+
+local FlyActions =
+    Instance.new(
+        "Frame",
+        TabPlayer
+    )
+
+FlyActions.Size = UDim2.new(1, 0, 0, 36)
+FlyActions.BackgroundTransparency = 1
+FlyActions.LayoutOrder = 8
+
+local FlySpeedBox =
+    Instance.new(
+        "TextBox",
+        FlyActions
+    )
+
+FlySpeedBox.Size = UDim2.new(0.34, -4, 1, 0)
+FlySpeedBox.Position = UDim2.new(0, 0, 0, 0)
+FlySpeedBox.BackgroundColor3 = THEME.PanelDark
+FlySpeedBox.BackgroundTransparency = 0.3
+FlySpeedBox.BorderSizePixel = 0
+FlySpeedBox.TextColor3 = THEME.TextWhite
+FlySpeedBox.PlaceholderColor3 = THEME.TextGray
+FlySpeedBox.PlaceholderText = "Speed Fly"
+FlySpeedBox.Text = "70"
+FlySpeedBox.Font = Enum.Font.GothamMedium
+FlySpeedBox.TextSize = 11
+FlySpeedBox.ClearTextOnFocus = false
+
+ApplyCorner(FlySpeedBox, 6)
+ApplyStroke(FlySpeedBox, THEME.Outline, 1)
+
+local FlyBtn =
+    CreateButton(
+        FlyActions,
+        "OFF",
+        THEME.Accent,
+        1
+    )
+
+FlyBtn.Size = UDim2.new(0.20, -4, 1, 0)
+FlyBtn.Position = UDim2.new(0.34, 2, 0, 0)
+
+local SetFlySpeedBtn =
+    CreateButton(
+        FlyActions,
+        "SET",
+        THEME.Accent,
+        2
+    )
+
+SetFlySpeedBtn.Size = UDim2.new(0.21, -4, 1, 0)
+SetFlySpeedBtn.Position = UDim2.new(0.54, 2, 0, 0)
+
+local ResetFlySpeedBtn =
+    CreateButton(
+        FlyActions,
+        "RESET",
+        THEME.Accent,
+        3
+    )
+
+ResetFlySpeedBtn.Size = UDim2.new(0.25, -2, 1, 0)
+ResetFlySpeedBtn.Position = UDim2.new(0.75, 2, 0, 0)
+
+-- =========================================================
+-- TELEPORT TO PLAYER
+-- Metode sama seperti source: Players:FindFirstChild(username), lalu
+-- HumanoidRootPart CFrame ke target + Vector3.new(0, 5, 0).
+-- =========================================================
+local TeleportPlayerLabel =
+    Instance.new(
+        "TextLabel",
+        TabPlayer
+    )
+
+TeleportPlayerLabel.Size = UDim2.new(1, 0, 0, 20)
+TeleportPlayerLabel.BackgroundTransparency = 1
+TeleportPlayerLabel.Text = "Teleport Player"
+TeleportPlayerLabel.TextColor3 = THEME.TextWhite
+TeleportPlayerLabel.Font = Enum.Font.GothamBold
+TeleportPlayerLabel.TextSize = 12
+TeleportPlayerLabel.TextXAlignment = Enum.TextXAlignment.Left
+TeleportPlayerLabel.LayoutOrder = 9
+
+local TeleportPlayerActions =
+    Instance.new(
+        "Frame",
+        TabPlayer
+    )
+
+TeleportPlayerActions.Size = UDim2.new(1, 0, 0, 36)
+TeleportPlayerActions.BackgroundTransparency = 1
+TeleportPlayerActions.LayoutOrder = 10
+
+local TeleportPlayerBox =
+    Instance.new(
+        "TextBox",
+        TeleportPlayerActions
+    )
+
+TeleportPlayerBox.Size = UDim2.new(0.70, -4, 1, 0)
+TeleportPlayerBox.Position = UDim2.new(0, 0, 0, 0)
+TeleportPlayerBox.BackgroundColor3 = THEME.PanelDark
+TeleportPlayerBox.BackgroundTransparency = 0.3
+TeleportPlayerBox.BorderSizePixel = 0
+TeleportPlayerBox.TextColor3 = THEME.TextWhite
+TeleportPlayerBox.PlaceholderColor3 = THEME.TextGray
+TeleportPlayerBox.PlaceholderText = "Username Player"
+TeleportPlayerBox.Text = ""
+TeleportPlayerBox.Font = Enum.Font.GothamMedium
+TeleportPlayerBox.TextSize = 11
+TeleportPlayerBox.ClearTextOnFocus = false
+
+ApplyCorner(TeleportPlayerBox, 6)
+ApplyStroke(TeleportPlayerBox, THEME.Outline, 1)
+
+local TeleportPlayerBtn =
+    CreateButton(
+        TeleportPlayerActions,
+        "Teleport",
+        THEME.Accent,
+        1
+    )
+
+TeleportPlayerBtn.Size = UDim2.new(0.30, -2, 1, 0)
+TeleportPlayerBtn.Position = UDim2.new(0.70, 2, 0, 0)
+
+TeleportPlayerBtn.MouseButton1Click:Connect(function()
+    local target =
+        Players:FindFirstChild(TeleportPlayerBox.Text)
+
+    if target and target.Character then
+        local targetRoot =
+            target.Character:FindFirstChild("HumanoidRootPart")
+
+        local myRoot =
+            LocalPlayer.Character
+            and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+
+        if targetRoot and myRoot then
+            myRoot.CFrame =
+                targetRoot.CFrame
+                + Vector3.new(0, 5, 0)
+        end
+    else
+        TeleportPlayerBox.Text = ""
+        TeleportPlayerBox.PlaceholderText = "Player not found!"
+    end
+end)
+
+-- Fly engine is installed asynchronously and protected by pcall.
+task.defer(function()
+    local ok, err = pcall(function()
+        local FLY_SPEED = 70
+        local DEFAULT_FLY_SPEED = 70
+        local FLY_ANIMATION_ID = "rbxassetid://104055597101866"
+
+        local FlyEnabled = false
+        local FlyCharacter
+        local FlyHumanoid
+        local FlyRoot
+        local FlyAttachment
+        local FlyVelocity
+        local FlyAuraTrack
+        local FlyAnimateScript
+        local FlyOldCollide = {}
+        local FlyOldPlatformStand = false
+        local FlyOldAutoRotate = true
+
+        local function getFlyCharacter()
+            FlyCharacter = LocalPlayer.Character
+            if not FlyCharacter then
+                FlyHumanoid = nil
+                FlyRoot = nil
+                FlyAnimateScript = nil
+                return false
+            end
+
+            FlyHumanoid = FlyCharacter:FindFirstChildOfClass("Humanoid")
+            FlyRoot = FlyCharacter:FindFirstChild("HumanoidRootPart")
+            FlyAnimateScript = FlyCharacter:FindFirstChild("Animate")
+
+            return FlyHumanoid ~= nil and FlyRoot ~= nil
+        end
+
+        -- FLY PATCH: follows camera LookVector/RightVector + camera UpVector; Fly animation is independent.
+        local function stopFlyAnimation()
+            if FlyAuraTrack then
+                pcall(function()
+                    FlyAuraTrack:Stop(0)
+                    FlyAuraTrack:Destroy()
+                end)
+                FlyAuraTrack = nil
+            end
+        end
+
+        local function startFlyAnimation()
+            stopFlyAnimation()
+            if not FlyHumanoid then return end
+
+            local animator = FlyHumanoid:FindFirstChildOfClass("Animator")
+            if not animator then
+                animator = Instance.new("Animator")
+                animator.Parent = FlyHumanoid
+            end
+
+            for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+                pcall(function()
+                    track:Stop(0)
+                end)
+            end
+
+            if FlyAnimateScript then
+                FlyAnimateScript.Enabled = false
+            end
+
+            local animation = Instance.new("Animation")
+            animation.AnimationId = FLY_ANIMATION_ID
+
+            local loaded, track = pcall(function()
+                return animator:LoadAnimation(animation)
+            end)
+
+            animation:Destroy()
+            if not loaded or not track then return end
+
+            FlyAuraTrack = track
+            FlyAuraTrack.Looped = true
+            FlyAuraTrack.Priority = Enum.AnimationPriority.Action4
+
+            pcall(function()
+                FlyAuraTrack:Play(0.05, 1, 1)
+                FlyAuraTrack:AdjustWeight(1, 0.05)
+                FlyAuraTrack:AdjustSpeed(1)
+            end)
+        end
+
+        local function setFlyNoClip(on)
+            if not FlyCharacter then return end
+
+            if on then
+                FlyOldCollide = {}
+                for _, v in ipairs(FlyCharacter:GetDescendants()) do
+                    if v:IsA("BasePart") then
+                        FlyOldCollide[v] = v.CanCollide
+                        v.CanCollide = false
+                    end
+                end
+            else
+                for part, state in pairs(FlyOldCollide) do
+                    if part and part.Parent then
+                        part.CanCollide = state
+                    end
+                end
+                FlyOldCollide = {}
+            end
+        end
+
+        local function stopFly()
+            FlyEnabled = false
+
+            -- Stop and remove the dedicated Fly animation first.
+            stopFlyAnimation()
+
+            -- Release Fly's Humanoid control so Walk/Run/Idle/Jump can resume.
+            if FlyHumanoid then
+                pcall(function()
+                    FlyHumanoid.PlatformStand = FlyOldPlatformStand
+                    FlyHumanoid.AutoRotate = FlyOldAutoRotate
+                end)
+            end
+
+            -- Restore the normal Animate controller only after Fly animation
+            -- has been completely stopped.
+            if FlyAnimateScript then
+                pcall(function()
+                    FlyAnimateScript.Enabled = true
+                end)
+            end
+
+            setFlyNoClip(false)
+
+            if FlyVelocity then
+                pcall(function()
+                    FlyVelocity:Destroy()
+                end)
+                FlyVelocity = nil
+            end
+
+            if FlyAttachment then
+                pcall(function()
+                    FlyAttachment:Destroy()
+                end)
+                FlyAttachment = nil
+            end
+
+            if FlyRoot then
+                FlyRoot.AssemblyLinearVelocity = Vector3.zero
+                FlyRoot.AssemblyAngularVelocity = Vector3.zero
+            end
+
+            FlyBtn.Text = "OFF"
+        end
+
+        local function startFly()
+            if not getFlyCharacter() then
+                return
+            end
+
+            FlyEnabled = true
+
+            FlyAttachment = Instance.new("Attachment")
+            FlyAttachment.Name = "BONETO_FlyAttachment"
+            FlyAttachment.Parent = FlyRoot
+
+            FlyVelocity = Instance.new("LinearVelocity")
+            FlyVelocity.Name = "BONETO_FlyVelocity"
+            FlyVelocity.Attachment0 = FlyAttachment
+            FlyVelocity.RelativeTo = Enum.ActuatorRelativeTo.World
+            FlyVelocity.MaxForce = math.huge
+            FlyVelocity.VectorVelocity = Vector3.zero
+            FlyVelocity.Parent = FlyRoot
+
+            FlyOldAutoRotate = FlyHumanoid.AutoRotate
+            FlyOldPlatformStand = FlyHumanoid.PlatformStand
+
+            FlyHumanoid.AutoRotate = false
+            FlyHumanoid.PlatformStand = true
+
+            setFlyNoClip(true)
+            startFlyAnimation()
+            FlyBtn.Text = "ON"
+        end
+
+        FlyBtn.MouseButton1Click:Connect(function()
+            if FlyEnabled then
+                stopFly()
+            else
+                startFly()
+            end
+        end)
+
+        SetFlySpeedBtn.MouseButton1Click:Connect(function()
+            local value = tonumber(FlySpeedBox.Text)
+            if value and value > 0 then
+                FLY_SPEED = math.clamp(value, 1, 200)
+                FlySpeedBox.Text = tostring(FLY_SPEED)
+            else
+                FlySpeedBox.Text = tostring(FLY_SPEED)
+            end
+        end)
+
+        ResetFlySpeedBtn.MouseButton1Click:Connect(function()
+            FLY_SPEED = DEFAULT_FLY_SPEED
+            FlySpeedBox.Text = tostring(DEFAULT_FLY_SPEED)
+        end)
+
+        FlySpeedBox.FocusLost:Connect(function()
+            local value = tonumber(FlySpeedBox.Text)
+            if value and value > 0 then
+                FLY_SPEED = math.clamp(value, 1, 200)
+                FlySpeedBox.Text = tostring(FLY_SPEED)
+            else
+                FlySpeedBox.Text = tostring(FLY_SPEED)
+            end
+        end)
+
+        RunService.RenderStepped:Connect(function()
+            if not FlyEnabled or not FlyRoot or not FlyRoot.Parent or not FlyCharacter then
+                return
+            end
+
+            local cam = workspace.CurrentCamera
+            if not cam then return end
+
+            for _, v in ipairs(FlyCharacter:GetDescendants()) do
+                if v:IsA("BasePart") and v.CanCollide then
+                    v.CanCollide = false
+                end
+            end
+
+            if FlyAuraTrack then
+                FlyAuraTrack:AdjustWeight(1, 0)
+                FlyAuraTrack:AdjustSpeed(1)
+            end
+
+            -- Fly sekarang sepenuhnya mengikuti arah kamera.
+            -- Tidak ada lagi Space / Ctrl / C untuk naik-turun.
+            -- W/S mengikuti LookVector kamera, termasuk komponen Y.
+            -- A/D mengikuti RightVector kamera.
+            local move = Vector3.zero
+
+            if UserInputService:IsKeyDown(Enum.KeyCode.W) then
+                move += cam.CFrame.LookVector
+            end
+            if UserInputService:IsKeyDown(Enum.KeyCode.S) then
+                move -= cam.CFrame.LookVector
+            end
+            if UserInputService:IsKeyDown(Enum.KeyCode.D) then
+                move += cam.CFrame.RightVector
+            end
+            if UserInputService:IsKeyDown(Enum.KeyCode.A) then
+                move -= cam.CFrame.RightVector
+            end
+
+            -- Ambil analog/mobile/gamepad juga, tetapi tetap mengikuti
+            -- orientasi kamera. MoveDirection dipakai hanya saat tidak ada
+            -- input keyboard sehingga tidak menambah dorongan ganda.
+            if move.Magnitude <= 0.001 and FlyHumanoid then
+                local analog = FlyHumanoid.MoveDirection
+                if analog.Magnitude > 0.001 then
+                    move = analog
+                end
+            end
+
+            if move.Magnitude > 0.001 then
+                move = move.Unit
+
+                if FlyVelocity then
+                    if move.Magnitude > 0.001 then
+                        FlyVelocity.VectorVelocity = move * FLY_SPEED
+                    else
+                        FlyVelocity.VectorVelocity = Vector3.zero
+                    end
+                end
+
+                -- Ikuti metode Fly referensi:
+                -- arah gerak = arah kamera penuh (termasuk Y), lalu orientasi
+                -- karakter memakai UpVector kamera agar pitch/roll tidak kembali tegak.
+                pcall(function()
+                    -- Arah badan mengikuti orientasi kamera penuh.
+                    -- LookVector membawa pitch (menukik/menanjak), UpVector
+                    -- mempertahankan roll, dan tidak ada Humanoid AutoRotate
+                    -- yang dapat menegakkan badan kembali.
+                    local cameraCF = cam.CFrame
+                    local cameraLook = cameraCF.LookVector
+                    local cameraUp = cameraCF.UpVector
+
+                    if cameraLook.Magnitude > 0.001 and cameraUp.Magnitude > 0.001 then
+                        local targetCFrame = CFrame.lookAt(
+                            FlyRoot.Position,
+                            FlyRoot.Position + cameraLook.Unit,
+                            cameraUp.Unit
+                        )
+
+                        local alpha = math.clamp(1 - math.exp(-18 * 1 / 60), 0, 1)
+                        FlyRoot.CFrame = FlyRoot.CFrame:Lerp(
+                            targetCFrame,
+                            alpha
+                        )
+                    end
+                end)
+            else
+                -- Tidak ada input = benar-benar diam.
+                if FlyVelocity then
+                    FlyVelocity.VectorVelocity = Vector3.zero
+                end
+            end
+
+            -- Cegah physics/benturan memutar tubuh sendiri.
+            FlyRoot.AssemblyAngularVelocity = Vector3.zero
+        end)
+
+        LocalPlayer.CharacterAdded:Connect(function()
+            if FlyEnabled then
+                stopFly()
+            end
+        end)
+    end)
+
+    if not ok then
+        warn("[BONETO] Fly initialization failed: " .. tostring(err))
+    end
+end)
+
+local ESPObjects = {}
+
+local function setFeatureButton(
+    btn,
+    label,
+    state
+)
+    btn.Text =
+        label
+        .. ": "
+        .. (
+            state
+            and "ON"
+            or "OFF"
+        )
+
+    btn.TextColor3 = THEME.TextWhite
+
+    btn.UIStroke.Color =
+        state
+        and THEME.Accent
+        or THEME.Outline
+end
+
+local function addESP(character)
+    if
+        not character
+        or character == LocalPlayer.Character
+        or character:FindFirstChild(
+            "BONETO_ESP"
+        )
+    then
+        return
+    end
+
+    local h =
+        Instance.new("Highlight")
+
+    h.Name = "BONETO_ESP"
+
+    h.FillColor =
+        THEME.TextWhite
+
+    h.OutlineColor =
+        THEME.Accent
+
+    h.FillTransparency = 0.6
+    h.Adornee = character
+    h.Parent = character
+
+    ESPObjects[character] = h
+end
+
+local function removeESP(character)
+    if ESPObjects[character] then
+        ESPObjects[character]:Destroy()
+        ESPObjects[character] = nil
+    end
+end
+
+ESPBtn.MouseButton1Click:Connect(function()
+    ESPEnabled =
+        not ESPEnabled
+
+    setFeatureButton(
+        ESPBtn,
+        "ESP",
+        ESPEnabled
+    )
+
+    for _, player in ipairs(
+        Players:GetPlayers()
+    ) do
+        if
+            player ~= LocalPlayer
+            and player.Character
+        then
+            if ESPEnabled then
+                addESP(player.Character)
+            else
+                removeESP(player.Character)
+            end
+        end
+    end
+end)
+
+local function setupESP(player)
+    if player == LocalPlayer then
+        return
+    end
+
+    player.CharacterAdded:Connect(
+        function(character)
+            task.wait(0.25)
+
+            if ESPEnabled then
+                addESP(character)
+            end
+        end
+    )
+end
+
+for _, player in ipairs(
+    Players:GetPlayers()
+) do
+    setupESP(player)
+end
+
+Players.PlayerAdded:Connect(setupESP)
+
+Players.PlayerRemoving:Connect(function(player)
+    if player.Character then
+        removeESP(player.Character)
+    end
+end)
+
+InfJumpBtn.MouseButton1Click:Connect(function()
+    InfiniteJumpEnabled =
+        not InfiniteJumpEnabled
+
+    setFeatureButton(
+        InfJumpBtn,
+        "INFINITE JUMP",
+        InfiniteJumpEnabled
+    )
+end)
+
+UserInputService.JumpRequest:Connect(function()
+    if ScriptClosed then
+        return
+    end
+
+    if InfiniteJumpEnabled then
+        local hum =
+            LocalPlayer.Character
+            and LocalPlayer.Character:FindFirstChildOfClass(
+                "Humanoid"
+            )
+
+        if hum then
+            hum:ChangeState(
+                Enum.HumanoidStateType.Jumping
+            )
+        end
+    end
+end)
+
+NoclipBtn.MouseButton1Click:Connect(function()
+    NoclipEnabled =
+        not NoclipEnabled
+
+    setFeatureButton(
+        NoclipBtn,
+        "NO CLIP",
+        NoclipEnabled
+    )
+end)
+
+RunService.Stepped:Connect(function()
+    if ScriptClosed then
+        return
+    end
+
+    if
+        NoclipEnabled
+        and LocalPlayer.Character
+    then
+        for _, part in ipairs(
+            LocalPlayer.Character:GetDescendants()
+        ) do
+            if part:IsA("BasePart") then
+                part.CanCollide = false
+            end
+        end
+    end
+end)
+
+local hiddenStates, hideConnections =
+    {},
+    {}
+
+local function hideObject(obj)
+    if not obj or not obj.Parent then
+        return
+    end
+
+    if not hiddenStates[obj] then
+        hiddenStates[obj] = {}
+    end
+
+    local state =
+        hiddenStates[obj]
+
+    if obj:IsA("BasePart") then
+        if state.LocalTransparencyModifier == nil then
+            state.LocalTransparencyModifier =
+                obj.LocalTransparencyModifier
+        end
+
+        obj.LocalTransparencyModifier = 1
+
+    elseif
+        obj:IsA("Decal")
+        or obj:IsA("Texture")
+    then
+        if state.Transparency == nil then
+            state.Transparency =
+                obj.Transparency
+        end
+
+        obj.Transparency = 1
+
+    elseif
+        obj:IsA("ParticleEmitter")
+        or obj:IsA("Trail")
+        or obj:IsA("Beam")
+    then
+        if state.Enabled == nil then
+            state.Enabled =
+                obj.Enabled
+        end
+
+        obj.Enabled = false
+    end
+end
+
+local function hideCharacter(character)
+    if not character then
+        return
+    end
+
+    for _, obj in ipairs(
+        character:GetDescendants()
+    ) do
+        hideObject(obj)
+    end
+
+    if not hideConnections[character] then
+        hideConnections[character] =
+            character.DescendantAdded:Connect(
+                function(obj)
+                    if HidePlayersEnabled then
+                        task.defer(function()
+                            hideObject(obj)
+                        end)
+                    end
+                end
+            )
+    end
+end
+
+local function restoreHidden()
+    for obj, state in pairs(
+        hiddenStates
+    ) do
+        if obj and obj.Parent then
+            if
+                obj:IsA("BasePart")
+                and state.LocalTransparencyModifier ~= nil
+            then
+                obj.LocalTransparencyModifier =
+                    state.LocalTransparencyModifier
+
+            elseif
+                (
+                    obj:IsA("Decal")
+                    or obj:IsA("Texture")
+                )
+                and state.Transparency ~= nil
+            then
+                obj.Transparency =
+                    state.Transparency
+
+            elseif
+                (
+                    obj:IsA("ParticleEmitter")
+                    or obj:IsA("Trail")
+                    or obj:IsA("Beam")
+                )
+                and state.Enabled ~= nil
+            then
+                obj.Enabled =
+                    state.Enabled
+            end
+        end
+    end
+
+    table.clear(hiddenStates)
+end
+
+HidePlayersBtn.MouseButton1Click:Connect(function()
+    HidePlayersEnabled =
+        not HidePlayersEnabled
+
+    setFeatureButton(
+        HidePlayersBtn,
+        "HIDE ALL PLAYER",
+        HidePlayersEnabled
+    )
+
+    if HidePlayersEnabled then
+        for _, player in ipairs(
+            Players:GetPlayers()
+        ) do
+            if
+                player ~= LocalPlayer
+                and player.Character
+            then
+                hideCharacter(
+                    player.Character
+                )
+            end
+        end
+    else
+        restoreHidden()
+    end
+end)
+
+local function setupHidePlayer(player)
+    if player == LocalPlayer then
+        return
+    end
+
+    player.CharacterAdded:Connect(
+        function(character)
+            task.wait(0.2)
+
+            if HidePlayersEnabled then
+                hideCharacter(character)
+            end
+        end
+    )
+end
+
+for _, player in ipairs(
+    Players:GetPlayers()
+) do
+    setupHidePlayer(player)
+end
+
+Players.PlayerAdded:Connect(
+    setupHidePlayer
+)
+
+-- Keterangan fungsi.
+
+local SetLayout =
+    Instance.new(
+        "UIListLayout",
+        TabSettings
+    )
+
+SetLayout.Padding =
+    UDim.new(0, 10)
+SetLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+-- Pengaturan tombol pintas
+local HotkeysLabel = Instance.new("TextLabel", TabSettings)
+HotkeysLabel.Size = UDim2.new(1, 0, 0, 24)
+HotkeysLabel.BackgroundTransparency = 1
+HotkeysLabel.Text = "Hotkeys"
+HotkeysLabel.TextColor3 = THEME.TextWhite
+HotkeysLabel.Font = Enum.Font.GothamMedium
+HotkeysLabel.TextSize = 13
+HotkeysLabel.TextXAlignment = Enum.TextXAlignment.Left
+HotkeysLabel.LayoutOrder = 0
+
+local RecordHotkey = nil
+local PlayHotkey = nil
+local WaitingForHotkey = nil
+
+local function CreateHotkeyRow(order)
+    local row = Instance.new("Frame", TabSettings)
+    row.Size = UDim2.new(1, 0, 0, 38)
+    row.BackgroundTransparency = 1
+    row.LayoutOrder = order
+
+    local layout = Instance.new("UIListLayout", row)
+    layout.FillDirection = Enum.FillDirection.Horizontal
+    layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    layout.VerticalAlignment = Enum.VerticalAlignment.Center
+    layout.Padding = UDim.new(0, 6)
+
+    return row
+end
+
+local PlayHotkeyRow = CreateHotkeyRow(1)
+local PlayHotkeySet = CreateButton(PlayHotkeyRow, "SET PLAY: NONE", THEME.Action.Play, 1)
+local PlayHotkeyReset = CreateButton(PlayHotkeyRow, "RESET", THEME.Action.Play, 2)
+PlayHotkeySet.Size = UDim2.new(0.5, -3, 1, 0)
+PlayHotkeyReset.Size = UDim2.new(0.5, -3, 1, 0)
+
+local RecordHotkeyRow = CreateHotkeyRow(2)
+local RecordHotkeySet = CreateButton(RecordHotkeyRow, "SET RECORD: NONE", THEME.Action.Record, 1)
+local RecordHotkeyReset = CreateButton(RecordHotkeyRow, "RESET", THEME.Action.Record, 2)
+RecordHotkeySet.Size = UDim2.new(0.5, -3, 1, 0)
+RecordHotkeyReset.Size = UDim2.new(0.5, -3, 1, 0)
+
+
+
+
+local CreditsFrame =
+    Instance.new(
+        "Frame",
+        TabSettings
+    )
+
+CreditsFrame.Size =
+    UDim2.new(1, 0, 0, 100)
+
+CreditsFrame.BackgroundColor3 =
+    THEME.PanelDark
+
+CreditsFrame.BackgroundTransparency = 0.5
+CreditsFrame.LayoutOrder = 999
+
+ApplyCorner(CreditsFrame, 8)
+ApplyStroke(
+    CreditsFrame,
+    THEME.Outline,
+    1
+)
+
+local CreditsTxt =
+    Instance.new(
+        "TextLabel",
+        CreditsFrame
+    )
+
+CreditsTxt.Size =
+    UDim2.new(1, -20, 1, -20)
+
+CreditsTxt.Position =
+    UDim2.new(0, 10, 0, 10)
+
+CreditsTxt.BackgroundTransparency = 1
+
+CreditsTxt.Text =
+    "Premium Macro Engine\nCreated by BONETO\n\nEnhance your gameplay gracefully."
+
+CreditsTxt.TextColor3 = THEME.TextWhite
+
+CreditsTxt.Font =
+    Enum.Font.GothamMedium
+
+CreditsTxt.TextSize = 13
+
+-- Keterangan fungsi.
+
+local fpsFrames = 0
+local fpsLast = tick()
+
+RunService.RenderStepped:Connect(function()
+    fpsFrames += 1
+
+    local now = tick()
+
+    if now - fpsLast >= 1 then
+        if performanceEnabled then
+            fpsLabel.Text =
+                "FPS: "
+                .. tostring(fpsFrames)
+
+            if fpsFrames >= 50 then
+                fpsLabel.TextColor3 = THEME.TextWhite
+
+            elseif fpsFrames >= 30 then
+                fpsLabel.TextColor3 = THEME.TextWhite
+
+            else
+                fpsLabel.TextColor3 = THEME.TextWhite
+            end
+
+            local ping = 0
+
+            pcall(function()
+                ping =
+                    game:GetService(
+                        "Stats"
+                    )
+                    .Network
+                    .ServerStatsItem[
+                        "Data Ping"
+                    ]
+                    :GetValue()
+            end)
+
+            pingLabel.Text =
+                "PING: "
+                .. string.format(
+                    "%.0f",
+                    ping
+                )
+                .. "ms"
+        end
+
+        fpsFrames = 0
+        fpsLast = now
+    end
+end)
+
+-- Keterangan fungsi.
+
+local dragging,
+    dragInput,
+    dragStart,
+    startPos
+
+Header.InputBegan:Connect(function(input)
+    if
+        input.UserInputType
+            == Enum.UserInputType.MouseButton1
+        or input.UserInputType
+            == Enum.UserInputType.Touch
+    then
+        dragging = true
+        dragStart = input.Position
+        startPos = MainFrame.Position
+
+        input.Changed:Connect(function()
+            if
+                input.UserInputState
+                    == Enum.UserInputState.End
+            then
+                dragging = false
+            end
+        end)
+    end
+end)
+
+Header.InputChanged:Connect(function(input)
+    if
+        input.UserInputType
+            == Enum.UserInputType.MouseMovement
+        or input.UserInputType
+            == Enum.UserInputType.Touch
+    then
+        dragInput = input
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if input == dragInput and dragging then
+        local delta =
+            input.Position - dragStart
+
+        MainFrame.Position =
+            UDim2.new(
+                startPos.X.Scale,
+                startPos.X.Offset + delta.X,
+                startPos.Y.Scale,
+                startPos.Y.Offset + delta.Y
+            )
+    end
+end)
+
+local function OpenUI()
+    OpenBtn.Visible = false
+    MainFrame.Visible = true
+
+    MainFrame.Size =
+        UDim2.new(0, 600, 0, 420)
+
+    TweenService:Create(
+        MainFrame,
+        TweenInfo.new(
+            0.4,
+            Enum.EasingStyle.Back,
+            Enum.EasingDirection.Out
+        ),
+        {
+            Size =
+                UDim2.new(0, 680, 0, 480)
+        }
+    ):Play()
+end
+
+local function CloseUI()
+    TweenService:Create(
+        MainFrame,
+        TweenInfo.new(
+            0.3,
+            Enum.EasingStyle.Back,
+            Enum.EasingDirection.In
+        ),
+        {
+            Size =
+                UDim2.new(0, 600, 0, 420)
+        }
+    ):Play()
+
+    task.delay(0.3, function()
+        MainFrame.Visible = false
+        OpenBtn.Visible = true
+    end)
+end
+
+-- Bilah BONETO yang diperkecil dapat digeser terpisah dari jendela utama.
+local miniDragging = false
+local miniDragInput = nil
+local miniDragStart = nil
+local miniStartPos = nil
+local miniWasDragged = false
+
+OpenBtn.InputBegan:Connect(function(input)
+    if
+        input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch
+    then
+        miniDragging = true
+        miniWasDragged = false
+        miniDragStart = input.Position
+        miniStartPos = OpenBtn.Position
+
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                miniDragging = false
+            end
+        end)
+    end
+end)
+
+OpenBtn.InputChanged:Connect(function(input)
+    if
+        input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch
+    then
+        miniDragInput = input
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if input == miniDragInput and miniDragging then
+        local delta = input.Position - miniDragStart
+
+        if math.abs(delta.X) > 3 or math.abs(delta.Y) > 3 then
+            miniWasDragged = true
+        end
+
+        OpenBtn.Position =
+            UDim2.new(
+                miniStartPos.X.Scale,
+                miniStartPos.X.Offset + delta.X,
+                miniStartPos.Y.Scale,
+                miniStartPos.Y.Offset + delta.Y
+            )
+
+        if performanceFollowMini then
+            SetPerformanceBelowMini()
+        end
+    end
+end)
+
+-- Mengeklik bilah saat tidak sedang digeser akan membuka GUI utama.
+MinBtn.MouseButton1Click:Connect(CloseUI)
+OpenBtn.MouseButton1Click:Connect(function()
+    if not miniWasDragged then
+        OpenUI()
+    end
+    miniWasDragged = false
+end)
+
+local function UnloadScript()
+    -- =========================================================
+    -- HARD CLOSE
+    -- X bukan hanya menyembunyikan GUI.
+    -- Semua fungsi utama dimatikan SEBELUM GUI dihancurkan.
+    -- =========================================================
+    if ScriptClosed then
+        return
+    end
+
+    ScriptClosed = true
+
+    -- Matikan hotkey yang sudah pernah diset.
+    RecordHotkey = nil
+    PlayHotkey = nil
+    WaitingForHotkey = nil
+
+    -- Putuskan listener hotkey secara langsung.
+    if HotkeyConnection then
+        pcall(function()
+            HotkeyConnection:Disconnect()
+        end)
+        HotkeyConnection = nil
+    end
+
+    -- Matikan feature yang mempunyai listener global.
+    pcall(function()
+        InfiniteJumpEnabled = false
+        NoclipEnabled = false
+        ESPEnabled = false
+        HidePlayersEnabled = false
+    end)
+
+    -- Matikan monitor/perubahan graphics yang masih aktif.
+    pcall(function()
+        performanceEnabled = false
+        graphicsEnabled = false
+        if performanceGui then
+            performanceGui.Enabled = false
+        end
+    end)
+
+    -- Hentikan playback/record dan lepaskan connection yang
+    -- memang dimasukkan ke MacroEngine.Bin.
+    pcall(function()
+        MacroEngine.State = "Idle"
+        MacroEngine:CleanUp()
+    end)
+
+    if MacroEngine.PathFolder then
+        pcall(function()
+            MacroEngine.PathFolder:Destroy()
+        end)
+        MacroEngine.PathFolder = nil
+    end
+
+    -- GUI boleh ditutup dengan animasi, tetapi SCRIPT sudah mati
+    -- sejak baris ScriptClosed = true di atas.
+    pcall(function()
+        TweenService:Create(
+            MainFrame,
+            TweenInfo.new(
+                0.2,
+                Enum.EasingStyle.Quint,
+                Enum.EasingDirection.In
+            ),
+            {
+                Size = UDim2.new(0, 0, 0, 0)
+            }
+        ):Play()
+    end)
+
+    task.delay(0.2, function()
+        pcall(function()
+            if performanceGui then
+                performanceGui:Destroy()
+            end
+        end)
+
+        pcall(function()
+            ScreenGui:Destroy()
+        end)
+    end)
+end
+
+CloseBtn.MouseButton1Click:Connect(
+    UnloadScript
+)
+
+local function RefreshUI()
+    for _, child in ipairs(
+        FileScroll:GetChildren()
+    ) do
+        if child:IsA("TextButton") then
+            child:Destroy()
+        end
+    end
+
+    if not FSM.HasAccess then
+        return
+    end
+
+    for _, filePath in ipairs(
+        listfiles(CONFIG.Folder)
+    ) do
+        local fileName =
+            string.match(
+                filePath,
+                "([^/\\]+)%.json$"
+            )
+
+        if fileName then
+            local fileBtn =
+                Instance.new(
+                    "TextButton",
+                    FileScroll
+                )
+
+            fileBtn.Size =
+                UDim2.new(1, 0, 0, 32)
+
+            fileBtn.BackgroundTransparency = 1
+            fileBtn.BackgroundColor3 =
+                THEME.Accent
+
+            fileBtn.Text = fileName
+            fileBtn.TextColor3 = THEME.TextWhite
+
+            fileBtn.Font =
+                Enum.Font.GothamMedium
+
+            fileBtn.TextSize = 12
+
+            fileBtn.TextXAlignment =
+                Enum.TextXAlignment.Left
+
+            Instance.new(
+                "UIPadding",
+                fileBtn
+            ).PaddingLeft =
+                UDim.new(0, 10)
+
+            ApplyCorner(fileBtn, 6)
+
+            local stroke =
+                ApplyStroke(
+                    fileBtn,
+                    THEME.Outline,
+                    1
+                )
+
+            fileBtn.MouseEnter:Connect(function()
+                if stroke.Color ~= THEME.Accent then
+                    TweenService:Create(
+                        fileBtn,
+                        TweenInfo.new(0.2),
+                        {
+                            BackgroundTransparency = 0.8,
+                            TextColor3 = THEME.TextWhite
+                        }
+                    ):Play()
+                end
+            end)
+
+            fileBtn.MouseLeave:Connect(function()
+                if stroke.Color ~= THEME.Accent then
+                    TweenService:Create(
+                        fileBtn,
+                        TweenInfo.new(0.2),
+                        {
+                            BackgroundTransparency = 1,
+                            TextColor3 = THEME.TextWhite
+                        }
+                    ):Play()
+                end
+            end)
+
+            fileBtn.MouseButton1Click:Connect(function()
+                FileInput.Text = fileName
+
+                local data =
+                    FSM:Load(fileName)
+
+                if data then
+                    local loaded =
+                        MacroEngine:LoadCompetitorJSON(data)
+
+                    if not loaded then
+                        StatusPanel.Text =
+                            "Status: Load Failed"
+                        RecorderStatus.Text =
+                            StatusPanel.Text
+                        return
+                    end
+
+                    StatusPanel.Text =
+                        "Status: Loaded ("
+                        .. #MacroEngine.Frames
+                        .. " F)"
+
+                    for _, b in ipairs(
+                        FileScroll:GetChildren()
+                    ) do
+                        if b:IsA("TextButton") then
+                            TweenService:Create(
+                                b,
+                                TweenInfo.new(0.2),
+                                {
+                                    BackgroundTransparency = 1,
+                                    TextColor3 = THEME.TextWhite
+                                }
+                            ):Play()
+
+                            b.UIStroke.Color =
+                                THEME.Outline
+                        end
+                    end
+
+                    TweenService:Create(
+                        fileBtn,
+                        TweenInfo.new(0.2),
+                        {
+                            BackgroundTransparency = 0.6,
+                            TextColor3 = THEME.TextWhite
+                        }
+                    ):Play()
+
+                    stroke.Color =
+                        THEME.Accent
+
+                    if MacroEngine.ShowPath then
+                        pcall(function()
+                            if MacroEngine.ShowPath then
+                        MacroEngine:RenderPath()
+                    end
+                        end)
+                    end
+
+                    local visualStroke = FloatingVisualBtn:FindFirstChildOfClass("UIStroke")
+                    FloatingVisualBtn.Text = MacroEngine.ShowPath and "VISUAL: ON" or "VISUAL: OFF"
+                    if visualStroke then
+                        visualStroke.Color = MacroEngine.ShowPath and THEME.Action.Pause or THEME.Outline
+                    end
+                end
+            end)
+        end
+    end
+end
+
+RunService.RenderStepped:Connect(function()
+    if MacroEngine.State == "Recording" then
+        StatusPanel.Text =
+            string.format(
+                "REC | F: %d | %.1fs",
+                #MacroEngine.Frames,
+                os.clock()
+                    - MacroEngine.StartTime
+            )
+
+        StatusPanel.TextColor3 = THEME.TextWhite
+        RecorderStatus.Text = StatusPanel.Text
+
+    elseif MacroEngine.State == "Playing" then
+        if MacroEngine.IsLoopWaiting then
+            StatusPanel.Text =
+                string.format(
+                    "DELAY | %.1fs",
+                    math.max(
+                        0,
+                        MacroEngine.LoopDelay
+                            - (
+                                os.clock()
+                                - MacroEngine.LoopWaitStartTime
+                            )
+                    )
+                )
+        else
+            StatusPanel.Text =
+                string.format(
+                    "PLAY | F: %d | %.1fs",
+                    #MacroEngine.Frames,
+                    MacroEngine.CurrentTime
+                )
+        end
+
+        StatusPanel.TextColor3 = THEME.TextWhite
+        RecorderStatus.Text = StatusPanel.Text
+
+    else
+        StatusPanel.TextColor3 = THEME.TextWhite
+    end
+end)
+
+-- Pengaitan tombol
+RecordBtn.MouseButton1Click:Connect(function()
+    RecorderGui.Visible = not RecorderGui.Visible
+end)
+
+PlayBtn.MouseButton1Click:Connect(function()
+    MacroEngine:Play()
+end)
+
+
+local function HandleStop()
+    MacroEngine:Stop()
+
+    if MacroEngine.State == "Idle" then
+        StatusPanel.Text =
+            "Status: Idle"
+        RecorderStatus.Text = StatusPanel.Text
+    end
+end
+
+local function HandleSave()
+    if #MacroEngine.Frames <= 0 then
+        StatusPanel.Text =
+            "Status: Nothing to Save"
+        RecorderStatus.Text = StatusPanel.Text
+        return
+    end
+
+    local success, savedName =
+        FSM:Save(
+            FileInput.Text,
+            MacroEngine:BuildCompetitorJSON()
+        )
+
+    if success then
+        FileInput.Text = savedName
+        StatusPanel.Text =
+            "Status: Saved!"
+        RecorderStatus.Text = StatusPanel.Text
+        RefreshUI()
+    else
+        StatusPanel.Text =
+            "Status: Save Failed"
+        RecorderStatus.Text = StatusPanel.Text
+    end
+end
+
+-- RECORD LOCK:
+-- Saat recording aktif, PLAY dan VISUAL tidak boleh dipakai agar
+-- tidak ada bentrokan state playback/visual dengan recorder.
+local function IsRecording()
+    return MacroEngine.State == "Recording"
+end
+
+local function UpdateRecordLockedControls()
+    local locked = IsRecording()
+
+    -- PLAY
+    RecorderPlayBtn.AutoButtonColor = not locked
+    RecorderPlayBtn.Active = not locked
+    RecorderPlayBtn.TextTransparency = locked and 0.45 or 0
+
+    -- VISUAL (recorder panel)
+
+    -- VISUAL (left-side control)
+end
+
+RecorderRecordBtn.MouseButton1Click:Connect(function()
+    if MacroEngine.State == "Recording" then
+        MacroEngine:Stop()
+        SetPlaybackPanelLocked(false)
+        RecorderRecordBtn.Text = "RECORD: OFF"
+        FloatingPlayBtn.Text = "PLAY: OFF"
+        StatusPanel.Text = "Status: Record Stopped"
+        RecorderStatus.Text = StatusPanel.Text
+        UpdateRecordLockedControls()
+    else
+        MacroEngine:Record()
+        SetPlaybackPanelLocked(true)
+        RecorderRecordBtn.Text = "RECORD: ON"
+        RecorderPlayBtn.Text = "PLAY: OFF"
+        FloatingPlayBtn.Text = "PLAY: OFF"
+        UpdateRecordLockedControls()
+    end
+end)
+
+-- UNDO bertingkat saat tombol ditekan berulang dengan cepat:
+-- tap pertama = 10 frame, tap kedua = 20 frame, tap ketiga = 30 frame.
+-- Jarak tap maksimal 0.50 detik agar dianggap satu rangkaian spam.
+local UNDO_TAP_DELAY = 0.50
+local undoTapCount = 0
+local lastUndoTapTime = 0
+
+RecorderUndoBtn.MouseButton1Click:Connect(function()
+    local now = os.clock()
+
+    if now - lastUndoTapTime <= UNDO_TAP_DELAY then
+        undoTapCount = math.clamp(undoTapCount + 1, 1, 4)
+    else
+        undoTapCount = 1
+    end
+
+    lastUndoTapTime = now
+
+    local undoFrameCount = math.clamp(undoTapCount * 10, 10, 40)
+    local ok, message = MacroEngine:UndoRecord(undoFrameCount)
+
+    StatusPanel.Text = string.format(
+        "Status: %s | Tap %d = %d frame",
+        message,
+        undoTapCount,
+        undoFrameCount
+    )
+    RecorderStatus.Text = StatusPanel.Text
+
+    if ok then
+        RecorderRecordBtn.Text = "RECORD: ON"
+    end
+end)
+
+RecorderPlayBtn.MouseButton1Click:Connect(function()
+    -- PLAY terkunci selama RECORD aktif.
+    if IsRecording() then
+        return
+    end
+
+    if MacroEngine.State == "Playing" then
+        MacroEngine:Stop()
+        RecorderPlayBtn.Text = "PLAY: OFF"
+        FloatingPlayBtn.Text = "PLAY: OFF"
+        StatusPanel.Text = "Status: Playback Stopped"
+        RecorderStatus.Text = StatusPanel.Text
+    else
+        MacroEngine:Play()
+        RecorderPlayBtn.Text = "PLAY: ON"
+        FloatingPlayBtn.Text = "PLAY: ON"
+        RecorderRecordBtn.Text = "RECORD: OFF"
+    end
+
+    UpdateRecordLockedControls()
+end)
+
+RecorderSaveBtn.MouseButton1Click:Connect(function()
+    HandleSave()
+end)
+
+StopBtn.MouseButton1Click:Connect(
+    HandleStop
+)
+
+SaveBtn.MouseButton1Click:Connect(
+    HandleSave
+)
+
+-- Tombol pintas yang dapat diatur
+local function keyName(keyCode)
+    return keyCode and keyCode.Name or "NONE"
+end
+
+local function updateHotkeyButtons()
+    RecordHotkeySet.Text = "SET RECORD: " .. keyName(RecordHotkey)
+    PlayHotkeySet.Text = "SET PLAY: " .. keyName(PlayHotkey)
+end
+
+RecordHotkeySet.MouseButton1Click:Connect(function()
+    WaitingForHotkey = "Record"
+    RecordHotkeySet.Text = "PRESS A KEY..."
+end)
+
+RecordHotkeyReset.MouseButton1Click:Connect(function()
+    RecordHotkey = nil
+    WaitingForHotkey = nil
+    updateHotkeyButtons()
+end)
+
+PlayHotkeySet.MouseButton1Click:Connect(function()
+    WaitingForHotkey = "Play"
+    PlayHotkeySet.Text = "PRESS A KEY..."
+end)
+
+PlayHotkeyReset.MouseButton1Click:Connect(function()
+    PlayHotkey = nil
+    WaitingForHotkey = nil
+    updateHotkeyButtons()
+end)
+
+updateHotkeyButtons()
+
+local HotkeyConnection = UserInputService.InputBegan:Connect(function(input, gpe)
+    if ScriptClosed then
+        return
+    end
+
+    if input.UserInputType ~= Enum.UserInputType.Keyboard then
+        return
+    end
+
+    if WaitingForHotkey then
+        if WaitingForHotkey == "Record" then
+            RecordHotkey = input.KeyCode
+        elseif WaitingForHotkey == "Play" then
+            PlayHotkey = input.KeyCode
+        end
+        WaitingForHotkey = nil
+        updateHotkeyButtons()
+        return
+    end
+
+    if gpe then
+        return
+    end
+
+    if RecordHotkey and input.KeyCode == RecordHotkey then
+        if MacroEngine.State == "Idle" then
+            MacroEngine:Record()
+        elseif MacroEngine.State == "Recording" then
+            HandleStop()
+        end
+    elseif PlayHotkey and input.KeyCode == PlayHotkey then
+        -- SET PLAY bersifat toggle: tekan sekali untuk mulai, tekan lagi untuk stop.
+        if MacroEngine.State == "Playing" then
+            HandleStop()
+        else
+            MacroEngine:Play()
+        end
+    end
+end)
+
+local function HandleDeleteSelected()
+    if not FSM.HasAccess then
+        return
+    end
+
+    local name =
+        FileInput.Text:gsub(
+            "[^%w%_]",
+            ""
+        )
+
+    local path =
+        CONFIG.Folder
+        .. "/"
+        .. name
+        .. ".json"
+
+    if
+        name ~= ""
+        and isfile(path)
+    then
+        delfile(path)
+
+        FileInput.Text = ""
+
+        table.clear(
+            MacroEngine.Frames
+        )
+
+        table.clear(
+            MacroEngine.AnimDict
+        )
+
+        if MacroEngine.PathFolder then
+            MacroEngine.PathFolder:Destroy()
+        end
+
+        StatusPanel.Text =
+            "Status: Deleted"
+        RecorderStatus.Text = StatusPanel.Text
+
+        RefreshUI()
+    end
+end
+
+DelBtn.MouseButton1Click:Connect(function()
+    HandleDeleteSelected()
+end)
+
+-- Refresh daftar Saved Macros secara manual.
+-- Berguna setelah file dihapus dari tombol DELETE SELECTED
+-- atau setelah file JSON dihapus/ditambahkan langsung dari folder.
+RefreshFilesBtn.MouseButton1Click:Connect(function()
+    if ScriptClosed then
+        return
+    end
+
+    RefreshUI()
+
+    StatusPanel.Text = "Status: File List Refreshed"
+    RecorderStatus.Text = StatusPanel.Text
+end)
+
+local function HandleDiscardRecord()
+    -- Hanya membuang hasil rekaman yang belum disimpan.
+    -- Tidak menghapus file JSON yang sudah tersimpan.
+    if MacroEngine.State == "Recording" or MacroEngine.State == "Playing" then
+        MacroEngine:Stop()
+    end
+
+    table.clear(MacroEngine.Frames)
+    table.clear(MacroEngine.AnimDict)
+    MacroEngine.CurrentTime = 0
+    MacroEngine.PlaybackIndex = 1
+    MacroEngine.LastPlaybackPosition = nil
+    MacroEngine.LastPlaybackFrameIndex = nil
+
+    if MacroEngine.PathFolder then
+        MacroEngine.PathFolder:Destroy()
+        MacroEngine.PathFolder = nil
+    end
+
+    FileInput.Text = ""
+    StatusPanel.Text = "Status: Record Deleted"
+    RecorderStatus.Text = StatusPanel.Text
+    if MacroEngine.ShowPath then
+                        MacroEngine:RenderPath()
+                    end
+end
+
+RecorderDeleteBtn.MouseButton1Click:Connect(function()
+    HandleDiscardRecord()
+end)
+
+SpeedMin.MouseButton1Click:Connect(function()
+    MacroEngine.Speed =
+        math.clamp(
+            MacroEngine.Speed - 0.1,
+            0.1,
+            5.0
+        )
+
+    SpeedText.Text =
+        string.format(
+            "Speed: %.1fx",
+            MacroEngine.Speed
+        )
+end)
+
+SpeedMax.MouseButton1Click:Connect(function()
+    MacroEngine.Speed =
+        math.clamp(
+            MacroEngine.Speed + 0.1,
+            0.1,
+            5.0
+        )
+
+    SpeedText.Text =
+        string.format(
+            "Speed: %.1fx",
+            MacroEngine.Speed
+        )
+end)
+
+-- Mengatur tab awal
+Tabs["autowalk"].Btn.BackgroundColor3 =
+    THEME.AccentDark
+
+Tabs["autowalk"].Btn.BackgroundTransparency =
+    0.2
+
+Tabs["autowalk"].Btn.TextColor3 = THEME.TextWhite
+
+Tabs["autowalk"].Frame.Visible = true
+
+-- STARTUP: GUI langsung terbuka pada tab AutoWalk.
+OpenBtn.Visible = false
+MainFrame.Visible = true
+MainFrame.Size = UDim2.new(0, 680, 0, 480)
+
+RefreshUI()
+UpdateRecordLockedControls()
