@@ -356,3 +356,5 @@ task.spawn(function()
         end
 
         task.wait(SCAN_INTERVAL)
+    end
+end)
